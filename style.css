@@ -24,8 +24,8 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   -webkit-font-smoothing: antialiased; }
 #app { min-height: 100vh; }
 
-.page { max-width: 720px; margin: 0 auto; min-height: 100vh; display: flex;
-  flex-direction: column; }
+.page { max-width: 720px; margin: 0 auto; min-height: 100vh;
+  display: flex; flex-direction: column; }
 
 .classic { font-family: "Songti SC", "SimSun", "Noto Serif SC", Georgia, serif;
   letter-spacing: .02em; }
@@ -35,7 +35,7 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   position: sticky; top: 0; background: var(--bg); z-index: 10; }
 .icon-btn { width: 38px; height: 38px; border: none; background: transparent;
   color: var(--ink); font-size: 26px; border-radius: 50%; cursor: pointer;
-  display: flex; align-items: center; justify-content: center; }
+  display: flex; align-items: center; justify-content: center; padding: 0; }
 .icon-btn:active { transform: scale(.94); }
 .icon-btn.ghost { visibility: hidden; }
 .topbar-title { flex: 1; min-width: 0; }
@@ -44,6 +44,11 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   overflow: hidden; text-overflow: ellipsis; }
 .queue-badge { font-size: 12px; color: var(--accent); background: var(--accent-soft);
   padding: 3px 10px; border-radius: 20px; font-weight: 600; }
+
+.btn-all { border: 1px solid var(--line); background: var(--surface);
+  color: var(--ink-2); font-size: 12.5px; padding: 6px 12px; border-radius: 20px;
+  cursor: pointer; font-family: inherit; }
+.btn-all:active { transform: scale(.96); }
 
 /* ---- 首页 ---- */
 .home-head { padding: 20px 18px 0; }
@@ -84,10 +89,72 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   font-weight: 600; color: #fff; background: var(--accent); border: none;
   border-radius: 12px; cursor: pointer; font-family: inherit;
   box-shadow: 0 6px 18px -8px rgba(138,90,59,.8); }
-.btn-main:active { transform: scale(.98); }
+.btn-main:active:not(:disabled) { transform: scale(.98); }
+.btn-main:disabled { background: var(--ink-3); box-shadow: none; cursor: not-allowed; }
 .btn-sub { display: block; width: 100%; padding: 14px; font-size: 15px;
   color: var(--ink-2); background: var(--surface); border: 1px solid var(--line);
   border-radius: 12px; cursor: pointer; margin-top: 10px; font-family: inherit; }
+
+/* ---- 科目选择页 ---- */
+.list-main { flex: 1; padding: 0 18px 48px; }
+
+.select-hint { font-size: 12.5px; color: var(--ink-3); margin-bottom: 12px;
+  padding-left: 2px; }
+
+.subject-select-list { display: grid; gap: 10px; margin-bottom: 30px; }
+
+.subject-select {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 15px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  cursor: pointer; transition: all .15s; position: relative;
+}
+.subject-select:active { transform: scale(.995); }
+.subject-select.checked {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.subject-select input[type=checkbox] {
+  position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none;
+}
+.sc-check {
+  width: 20px; height: 20px; flex: 0 0 auto;
+  border: 1.8px solid var(--line-2, #ded6c9); border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface); transition: all .15s;
+}
+.subject-select.checked .sc-check {
+  background: var(--accent); border-color: var(--accent);
+}
+.subject-select.checked .sc-check::after {
+  content: ''; width: 5px; height: 9px;
+  border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+.sc-icon { font-size: 22px; width: 44px; height: 44px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent-soft); border-radius: 11px; }
+.sc-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sc-name { font-size: 16px; font-weight: 600; }
+.sc-meta { font-size: 12px; color: var(--ink-3); }
+.due-num { color: var(--red); font-weight: 600; }
+
+.select-foot {
+  position: sticky; bottom: 0; left: 0; right: 0;
+  padding: 12px 18px calc(14px + env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(rgba(250,248,244,0), var(--bg) 40%);
+  border-top: 1px solid transparent;
+}
+.select-summary {
+  font-size: 13px; color: var(--ink-2); margin-bottom: 10px; text-align: center;
+}
+.select-summary b { color: var(--accent); font-size: 15px; }
+.due-tag {
+  display: inline-block; font-size: 11.5px; color: var(--red);
+  background: var(--red-soft); padding: 2px 8px; border-radius: 20px;
+  margin-left: 6px;
+}
 
 /* ---- 学习页 ---- */
 .step-bar { display: flex; gap: 8px; justify-content: center; padding: 6px 16px 14px; }
@@ -172,7 +239,6 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
 .done-sub { font-size: 14px; color: var(--ink-3); margin-bottom: 28px; }
 
 /* ---- 条文库 ---- */
-.list-main { flex: 1; padding: 0 18px 48px; }
 .subject-list, .passage-list { display: grid; gap: 10px; }
 .subject-card, .passage-item { display: flex; align-items: center; gap: 12px;
   width: 100%; padding: 14px 15px; background: var(--surface);
@@ -180,12 +246,6 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   cursor: pointer; text-align: left; font-family: inherit; font-size: inherit;
   color: inherit; }
 .subject-card:active, .passage-item:active { transform: scale(.995); }
-.sc-icon { font-size: 22px; width: 44px; height: 44px; flex: 0 0 auto;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--accent-soft); border-radius: 11px; }
-.sc-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.sc-name { font-size: 16px; font-weight: 600; }
-.sc-meta { font-size: 12px; color: var(--ink-3); }
 .sc-arrow { color: var(--ink-3); font-size: 22px; }
 .pi-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .pi-title { font-size: 14.5px; font-weight: 500; white-space: nowrap;
