@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v3.2
-   新增：科目选择（支持多选），可同时复习多本经典
+   app.js — 经典条文背诵 v3.3
+   修复：一个空只填一个字，输入自动跳下一空
    ============================================================ */
 (function () {
   'use strict';
@@ -35,13 +35,14 @@
   const normalize = s => String(s == null ? '' : s).replace(NORM_RE, '');
   const splitSegments = t => String(t).split(/[，。、；：？！“”‘’（）《》〈〉【】〔〕—…·,.;:?!"'()\[\]{}]+/).filter(Boolean);
 
-  /* ================= 挖空 ================= */
+  /* ================= 挖空：每个空只挖一个字 ================= */
   function buildMask(text, mode, seed) {
     const chars = Array.from(text);
     const mask = new Array(chars.length).fill(-1);
     let gid = 0;
 
     if (mode === 'full') {
+      // 默写：每个非标点字都是一个空
       for (let i = 0; i < chars.length; i++) {
         if (isPunct(chars[i])) continue;
         mask[i] = ++gid;
@@ -49,19 +50,11 @@
       return mask;
     }
 
+    // 挖空：随机挖掉约 60% 的单字，每字独立成空
     const rng = mulberry32(hashStr(seed + '::partial'));
-    let i = 0;
-    while (i < chars.length) {
-      if (isPunct(chars[i])) { i++; continue; }
-      if (rng() < 0.45) {
-        const len = 1 + Math.floor(rng() * 3);
-        let j = i, cnt = 0;
-        gid++;
-        while (j < chars.length && cnt < len && !isPunct(chars[j])) {
-          mask[j] = gid; cnt++; j++;
-        }
-        i = j;
-      } else i++;
+    for (let i = 0; i < chars.length; i++) {
+      if (isPunct(chars[i])) continue;
+      if (rng() < 0.6) mask[i] = ++gid;
     }
     return mask;
   }
@@ -74,15 +67,11 @@
         html += `<span class="c">${esc(chars[i])}</span>`;
         i++;
       } else {
-        const gid = mask[i];
-        let j = i;
-        while (j < chars.length && mask[j] === gid) j++;
-        const ans = chars.slice(i, j).join('');
-        const w = Math.max(1.6, ans.length * 1.15 + 0.5);
+        const ans = chars[i];
         html += `<input class="blank" type="text" data-answer="${esc(ans)}"
-                   style="width:${w}em" autocomplete="off" autocorrect="off"
+                   style="width:1.4em" autocomplete="off" autocorrect="off"
                    autocapitalize="off" spellcheck="false" inputmode="text">`;
-        i = j;
+        i++;
       }
     }
     return html;
@@ -188,7 +177,7 @@
   function dueReviewList() { return ALL_PASSAGES.filter(p => isDueReview(p.id)); }
   function remainingCount() { return ALL_PASSAGES.length - masteredCount(); }
 
-  /* ================= 队列（按选中的科目构建） ================= */
+  /* ================= 队列 ================= */
   function buildQueue() {
     const selected = new Set(state.selectedSubjects);
     const inSel = p => selected.has(p.subjectId);
@@ -257,7 +246,10 @@
     else if (state.screen === 'library') root.innerHTML = viewLibrary();
     window.scrollTo(0, 0);
     if (state.screen === 'learn' && (state.step === 'cloze' || state.step === 'full')) {
-      setTimeout(() => { const b = document.querySelector('#clozeBox input.blank'); if (b) try { b.focus(); } catch(e){} }, 80);
+      setTimeout(() => {
+        const b = document.querySelector('#clozeBox input.blank');
+        if (b) try { b.focus(); } catch(e){}
+      }, 80);
     }
   }
 
@@ -500,7 +492,7 @@
     const mask = buildMask(p.text, 'partial', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">补全空缺处（约挖去一半以上）</div>
+      <div class="hint-row">补全空缺处（每个空填一个字）</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -509,7 +501,7 @@
     const mask = buildMask(p.text, 'full', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">默写全文，标点已给出</div>
+      <div class="hint-row">默写全文，每个空填一个字，标点已给出</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -543,16 +535,26 @@
     return '';
   }
 
-  /* ================= 自动跳空 ================= */
+  /* ================= 输入处理 ================= */
   function isClozeInput(el) {
     return el && el.tagName === 'INPUT' && el.classList.contains('blank')
            && el.closest('#clozeBox');
   }
 
-  function tryAutoAdvance(inp) {
-    const ans = normalize(inp.dataset.answer);
-    const val = normalize(inp.value);
-    if (!ans || val.length < ans.length) return;
+  // 每个空只允许 1 个字；输入后自动跳到下一个空
+  function normalizeAndAdvance(inp, isComposing) {
+    // 限制单字：如果输入了多个字符，只保留最后一个
+    let v = inp.value || '';
+    if (v.length > 1) {
+      v = v.slice(-1);
+      inp.value = v;
+    }
+    inp.classList.remove('correct', 'wrong', 'revealed');
+
+    if (!v) return;
+    if (isComposing) return;   // 输入法合成中先不跳
+
+    // 跳到下一个未填的空
     const box = document.getElementById('clozeBox');
     if (!box) return;
     const inputs = Array.from(box.querySelectorAll('input.blank'));
@@ -568,9 +570,7 @@
   document.addEventListener('input', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
-    inp.classList.remove('correct', 'wrong', 'revealed');
-    if (e.isComposing || inp.dataset.composing === '1') return;
-    tryAutoAdvance(inp);
+    normalizeAndAdvance(inp, e.isComposing || inp.dataset.composing === '1');
   }, true);
 
   document.addEventListener('compositionstart', function (e) {
@@ -582,9 +582,10 @@
     const inp = e.target;
     if (!isClozeInput(inp)) return;
     inp.dataset.composing = '';
-    tryAutoAdvance(inp);
+    normalizeAndAdvance(inp, false);
   }, true);
 
+  // 回车下一个空 / 退格上一个空
   document.addEventListener('keydown', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
@@ -647,7 +648,6 @@
         startLearn();
         break;
 
-      /* ---- 总览 ---- */
       case 'know':
         state.step = 'choice';
         state.choice = null;
@@ -658,7 +658,6 @@
         break;
       case 'skip': skipCurrent(); break;
 
-      /* ---- 选择题 ---- */
       case 'pick-option': {
         state.pickedOption = el.dataset.value;
         state.feedback = null;
@@ -712,7 +711,6 @@
         render();
         break;
 
-      /* ---- 挖空 / 默写 ---- */
       case 'check-cloze': {
         if (state.locking) break;
         const box = document.getElementById('clozeBox');
@@ -783,7 +781,6 @@
         break;
       }
 
-      /* ---- 浏览 ---- */
       case 'view-subject':
         state.viewSubjectId = el.dataset.subject;
         render();
