@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v3.3
-   修复：一个空只填一个字，输入自动跳下一空
+   app.js — 经典条文背诵 v3.4
+   输入一串字 → 自动按字拆开，依次填入后续空
    ============================================================ */
 (function () {
   'use strict';
@@ -35,14 +35,13 @@
   const normalize = s => String(s == null ? '' : s).replace(NORM_RE, '');
   const splitSegments = t => String(t).split(/[，。、；：？！“”‘’（）《》〈〉【】〔〕—…·,.;:?!"'()\[\]{}]+/).filter(Boolean);
 
-  /* ================= 挖空：每个空只挖一个字 ================= */
+  /* ================= 挖空 ================= */
   function buildMask(text, mode, seed) {
     const chars = Array.from(text);
     const mask = new Array(chars.length).fill(-1);
     let gid = 0;
 
     if (mode === 'full') {
-      // 默写：每个非标点字都是一个空
       for (let i = 0; i < chars.length; i++) {
         if (isPunct(chars[i])) continue;
         mask[i] = ++gid;
@@ -50,7 +49,6 @@
       return mask;
     }
 
-    // 挖空：随机挖掉约 60% 的单字，每字独立成空
     const rng = mulberry32(hashStr(seed + '::partial'));
     for (let i = 0; i < chars.length; i++) {
       if (isPunct(chars[i])) continue;
@@ -492,7 +490,7 @@
     const mask = buildMask(p.text, 'partial', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">补全空缺处（每个空填一个字）</div>
+      <div class="hint-row">补全空缺处。可直接输入一整串字，系统会按字自动填入后续空</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -501,7 +499,7 @@
     const mask = buildMask(p.text, 'full', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">默写全文，每个空填一个字，标点已给出</div>
+      <div class="hint-row">默写全文。可连续输入，系统会按字填入，标点已给出</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -535,42 +533,64 @@
     return '';
   }
 
-  /* ================= 输入处理 ================= */
+  /* ================= 核心：按字分发输入 ================= */
   function isClozeInput(el) {
     return el && el.tagName === 'INPUT' && el.classList.contains('blank')
            && el.closest('#clozeBox');
   }
 
-  // 每个空只允许 1 个字；输入后自动跳到下一个空
-  function normalizeAndAdvance(inp, isComposing) {
-    // 限制单字：如果输入了多个字符，只保留最后一个
-    let v = inp.value || '';
-    if (v.length > 1) {
-      v = v.slice(-1);
-      inp.value = v;
-    }
-    inp.classList.remove('correct', 'wrong', 'revealed');
-
-    if (!v) return;
-    if (isComposing) return;   // 输入法合成中先不跳
-
-    // 跳到下一个未填的空
+  function getClozeInputs() {
     const box = document.getElementById('clozeBox');
-    if (!box) return;
-    const inputs = Array.from(box.querySelectorAll('input.blank'));
-    const idx = inputs.indexOf(inp);
-    for (let j = idx + 1; j < inputs.length; j++) {
-      if (!inputs[j].value) {
-        try { inputs[j].focus(); } catch (e) {}
-        return;
-      }
-    }
+    if (!box) return [];
+    return Array.from(box.querySelectorAll('input.blank'));
   }
 
+  function focusFirstEmpty(fromIdx) {
+    const inputs = getClozeInputs();
+    for (let i = fromIdx; i < inputs.length; i++) {
+      if (!inputs[i].value) { try { inputs[i].focus(); } catch (e) {} return; }
+    }
+    // 从 fromIdx 往后没有空的，从头找
+    for (let i = 0; i < inputs.length; i++) {
+      if (!inputs[i].value) { try { inputs[i].focus(); } catch (e) {} return; }
+    }
+    // 全填满，聚焦最后一个
+    if (inputs.length) try { inputs[inputs.length - 1].focus(); } catch (e) {}
+  }
+
+  // 把 inp 里的字符串按字拆开，从 inp 所在位置开始依次填入后续空
+  function distributeInput(inp) {
+    const inputs = getClozeInputs();
+    const startIdx = inputs.indexOf(inp);
+    if (startIdx < 0) return;
+
+    let raw = inp.value || '';
+    // 去掉所有空白
+    raw = raw.replace(/\s+/g, '');
+    if (!raw) return;
+
+    const chars = Array.from(raw);
+
+    // 从 startIdx 开始依次覆盖填入
+    let cursor = startIdx;
+    for (const ch of chars) {
+      if (cursor >= inputs.length) break;
+      inputs[cursor].value = ch;
+      inputs[cursor].classList.remove('correct', 'wrong', 'revealed');
+      cursor++;
+    }
+
+    // 光标跳到 cursor 之后第一个未填的空
+    focusFirstEmpty(cursor);
+  }
+
+  /* ---- input 事件 ---- */
   document.addEventListener('input', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
-    normalizeAndAdvance(inp, e.isComposing || inp.dataset.composing === '1');
+    // 输入法合成中，不处理，等 compositionend
+    if (e.isComposing || inp.dataset.composing === '1') return;
+    distributeInput(inp);
   }, true);
 
   document.addEventListener('compositionstart', function (e) {
@@ -582,25 +602,21 @@
     const inp = e.target;
     if (!isClozeInput(inp)) return;
     inp.dataset.composing = '';
-    normalizeAndAdvance(inp, false);
+    distributeInput(inp);
   }, true);
 
-  // 回车下一个空 / 退格上一个空
+  /* ---- 退格跳上一空，回车跳下一空 ---- */
   document.addEventListener('keydown', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
     if (e.key === 'Enter') {
       e.preventDefault();
-      const box = document.getElementById('clozeBox');
-      const inputs = Array.from(box.querySelectorAll('input.blank'));
+      const inputs = getClozeInputs();
       const idx = inputs.indexOf(inp);
-      for (let j = idx + 1; j < inputs.length; j++) {
-        if (!inputs[j].value) { try { inputs[j].focus(); } catch (err) {} return; }
-      }
+      focusFirstEmpty(idx + 1);
     }
     if (e.key === 'Backspace' && inp.value === '') {
-      const box = document.getElementById('clozeBox');
-      const inputs = Array.from(box.querySelectorAll('input.blank'));
+      const inputs = getClozeInputs();
       const idx = inputs.indexOf(inp);
       if (idx > 0) { try { inputs[idx - 1].focus(); } catch (err) {} }
     }
