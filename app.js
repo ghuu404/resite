@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v3.6
-   挖空：精确挖去 50% 非标点字
+   app.js — 经典条文背诵 v4.3
+   修复：已填过的空再次输入时直接替换该空，与光标位置无关
    ============================================================ */
 (function () {
   'use strict';
@@ -49,7 +49,6 @@
       return mask;
     }
 
-    // partial：精确挖去 50% 的非标点字
     const candidates = [];
     for (let i = 0; i < chars.length; i++) {
       if (!isPunct(chars[i])) candidates.push(i);
@@ -120,23 +119,32 @@
   }
 
   /* ================= 状态 ================= */
-  const STORAGE_KEY = 'jingdian-v3';
+  const STORAGE_KEY = 'jingdian-v4';
 
-  function getAllSubjectIds() {
-    const ids = [];
+  function getAllSubjects() {
+    const out = [];
     DATA.levels.forEach(lv => {
       if (lv.available === false) return;
-      (lv.subjects || []).forEach(s => ids.push(s.id));
+      (lv.subjects || []).forEach(s => out.push(s));
     });
-    return ids;
+    return out;
+  }
+
+  function findSubject(id) {
+    let found = null;
+    DATA.levels.forEach(lv => {
+      (lv.subjects || []).forEach(s => { if (s.id === id) found = s; });
+    });
+    return found;
   }
 
   const state = {
     screen: 'home',
     dailyGoal: 10,
     progress: {},
-    selectedSubjects: [],
+    subjectId: null,
     queue: [],
+    queueTotal: 0,
     currentId: null,
     step: 'overview',
     choice: null,
@@ -154,23 +162,27 @@
       const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
       if (raw.dailyGoal) state.dailyGoal = raw.dailyGoal;
       if (raw.progress) state.progress = raw.progress;
-      if (Array.isArray(raw.selectedSubjects)) {
-        state.selectedSubjects = raw.selectedSubjects;
-      } else {
-        state.selectedSubjects = getAllSubjectIds();
-      }
-    } catch (e) {
-      state.selectedSubjects = getAllSubjectIds();
-    }
+    } catch (e) {}
   }
   function save() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         dailyGoal: state.dailyGoal,
-        progress: state.progress,
-        selectedSubjects: state.selectedSubjects
+        progress: state.progress
       }));
     } catch (e) {}
+  }
+
+  function showToast(text, type) {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.className = 'toast show ' + (type || 'ok');
+    el.textContent = text;
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => {
+      const el2 = document.getElementById('toast');
+      if (el2) el2.className = 'toast';
+    }, 2200);
   }
 
   /* ================= 进度 ================= */
@@ -184,76 +196,214 @@
   function dueReviewList() { return ALL_PASSAGES.filter(p => isDueReview(p.id)); }
   function remainingCount() { return ALL_PASSAGES.length - masteredCount(); }
 
-  /* ================= 队列 ================= */
-  function buildQueue() {
-    const selected = new Set(state.selectedSubjects);
-    const inSel = p => selected.has(p.subjectId);
-
-    const due = dueReviewList().filter(inSel).map(p => p.id);
-    const fresh = ALL_PASSAGES
-      .filter(p => !isMastered(p.id) && inSel(p))
-      .slice(0, state.dailyGoal)
-      .map(p => p.id);
-
-    const set = new Set();
-    const q = [];
-    [...due, ...fresh].forEach(id => { if (!set.has(id)) { set.add(id); q.push(id); } });
-    return q;
+  function setStage(id, stage) {
+    const pr = getProg(id);
+    pr.stage = stage;
+    save();
   }
 
-  function startLearn() {
-    state.queue = buildQueue();
-    state.currentId = state.queue[0] || null;
-    state.step = 'overview';
-    state.choice = null;
-    state.feedback = null;
-    state.pickedOption = null;
-    state.locking = false;
-    state.hintOn = false;
-    state.screen = 'learn';
-    render();
-  }
-
-  function skipCurrent() {
-    if (!state.queue.length) return;
-    const id = state.queue.shift();
-    state.queue.push(id);
-    state.currentId = state.queue[0] || null;
-    state.step = 'overview';
-    state.choice = null;
-    state.feedback = null;
-    state.pickedOption = null;
-    state.locking = false;
-    state.hintOn = false;
-    render();
-  }
-
-  function completeCurrent() {
-    const id = state.currentId;
+  function markMastered(id) {
     const pr = getProg(id);
     pr.stage = 'mastered';
     pr.masteredAt = Date.now();
     pr.reviewCount = (pr.reviewCount || 0) + 1;
     pr.nextReviewAt = Date.now() + 2 * 24 * 3600 * 1000;
     save();
-    state.queue = state.queue.filter(x => x !== id);
-    state.currentId = state.queue[0] || null;
-    state.step = 'overview';
+  }
+
+  /* ================= 统计 ================= */
+  function getSubjectStats(s) {
+    let unfinished = 0, fresh = 0, due = 0, mastered = 0;
+    s.passages.forEach(p => {
+      const pr = state.progress[p.id];
+      const stage = pr ? pr.stage : 'new';
+      if (stage === 'mastered') {
+        mastered++;
+        if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) due++;
+      } else if (stage === 'new' || !stage) {
+        fresh++;
+      } else {
+        unfinished++;
+      }
+    });
+    const freshPlanned = Math.min(fresh, state.dailyGoal);
+    return {
+      unfinished, fresh, due, mastered,
+      total: s.passages.length,
+      freshPlanned,
+      today: unfinished + freshPlanned + due
+    };
+  }
+
+  /* ================= 队列 ================= */
+  function buildQueueForSubject(subjectId) {
+    const subject = findSubject(subjectId);
+    if (!subject) return [];
+
+    const unfinished = [];
+    const fresh = [];
+    const due = [];
+
+    subject.passages.forEach(p => {
+      const pr = state.progress[p.id];
+      const stage = pr ? pr.stage : 'new';
+      if (stage === 'mastered') {
+        if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) due.push(p.id);
+      } else if (stage === 'new' || !stage) {
+        fresh.push(p.id);
+      } else {
+        unfinished.push(p.id);
+      }
+    });
+
+    return [
+      ...unfinished,
+      ...fresh.slice(0, state.dailyGoal),
+      ...due
+    ];
+  }
+
+  function restoreStep() {
+    const pr = state.progress[state.currentId];
+    const stage = pr ? pr.stage : 'new';
+    if (stage === 'choice' || stage === 'cloze' || stage === 'full') {
+      state.step = stage;
+    } else {
+      state.step = 'overview';
+    }
+  }
+
+  function startSubject(subjectId) {
+    state.subjectId = subjectId;
+    state.queue = buildQueueForSubject(subjectId);
+    state.queueTotal = state.queue.length;
     state.choice = null;
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
     state.hintOn = false;
+
+    if (!state.queue.length) {
+      state.currentId = null;
+      state.screen = 'learn';
+      render();
+      return;
+    }
+
+    state.currentId = state.queue[0];
+    restoreStep();
+    state.screen = 'learn';
     render();
+  }
+
+  function skipCurrent() {
+    if (state.queue.length <= 1) return;
+    const id = state.queue.shift();
+    state.queue.push(id);
+    state.currentId = state.queue[0];
+    state.choice = null;
+    state.feedback = null;
+    state.pickedOption = null;
+    state.locking = false;
+    state.hintOn = false;
+    restoreStep();
+    render();
+  }
+
+  function advanceQueue() {
+    state.queue = state.queue.filter(x => x !== state.currentId);
+    state.currentId = state.queue[0] || null;
+    state.choice = null;
+    state.feedback = null;
+    state.pickedOption = null;
+    state.locking = false;
+    state.hintOn = false;
+    if (state.currentId) restoreStep();
+    else state.step = 'overview';
+    render();
+  }
+
+  /* ================= 导出 / 导入 ================= */
+  function exportData() {
+    const payload = {
+      app: 'jingdian',
+      version: 4,
+      exportedAt: new Date().toISOString(),
+      dailyGoal: state.dailyGoal,
+      progress: state.progress
+    };
+    const json = JSON.stringify(payload, null, 2);
+    const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const fname = `经典条文存档_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast('已导出：' + fname, 'ok');
+  }
+
+  function importData(file) {
+    const reader = new FileReader();
+    reader.onload = function (ev) {
+      try {
+        const raw = JSON.parse(ev.target.result);
+        if (!raw || typeof raw !== 'object') throw new Error('格式不对');
+        if (!raw.progress || typeof raw.progress !== 'object') throw new Error('缺少 progress');
+        const valid = {};
+        let skipped = 0;
+        Object.keys(raw.progress).forEach(k => {
+          if (PASSAGE_MAP[k]) valid[k] = raw.progress[k];
+          else skipped++;
+        });
+        if (!Object.keys(valid).length) throw new Error('没有可用的进度数据');
+
+        Object.assign(state.progress, valid);
+        if (raw.dailyGoal) state.dailyGoal = raw.dailyGoal;
+        save();
+        state.screen = 'home';
+        render();
+        showToast(`导入成功，共 ${Object.keys(valid).length} 条` + (skipped ? `（${skipped} 条无法匹配）` : ''), 'ok');
+      } catch (err) {
+        showToast('导入失败：' + (err.message || '文件损坏'), 'bad');
+      }
+    };
+    reader.onerror = function () { showToast('读取文件失败', 'bad'); };
+    reader.readAsText(file, 'utf-8');
+  }
+
+  function triggerImport() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.style.display = 'none';
+    input.addEventListener('change', function () {
+      const f = input.files && input.files[0];
+      if (f) importData(f);
+      document.body.removeChild(input);
+    });
+    document.body.appendChild(input);
+    input.click();
   }
 
   /* ================= 渲染 ================= */
   function render() {
     const root = document.getElementById('app');
     if (state.screen === 'home') root.innerHTML = viewHome();
-    else if (state.screen === 'select-subjects') root.innerHTML = viewSelectSubjects();
+    else if (state.screen === 'subjects') root.innerHTML = viewSubjects();
     else if (state.screen === 'learn') root.innerHTML = viewLearn();
     else if (state.screen === 'library') root.innerHTML = viewLibrary();
+    if (!document.getElementById('toast')) {
+      const t = document.createElement('div');
+      t.id = 'toast';
+      t.className = 'toast';
+      document.body.appendChild(t);
+    }
     window.scrollTo(0, 0);
     if (state.screen === 'learn' && (state.step === 'cloze' || state.step === 'full')) {
       setTimeout(() => {
@@ -290,6 +440,12 @@
     const days = Math.ceil(remain / state.dailyGoal) || 1;
     const due = dueReviewList().length;
 
+    let inProgress = 0;
+    ALL_PASSAGES.forEach(p => {
+      const pr = state.progress[p.id];
+      if (pr && (pr.stage === 'choice' || pr.stage === 'cloze' || pr.stage === 'full')) inProgress++;
+    });
+
     return `
       <div class="page">
         <header class="home-head">
@@ -316,6 +472,7 @@
               </div>
             </div>
             ${due > 0 ? `<div class="due-tip">有 <b>${due}</b> 条待复习</div>` : ''}
+            ${inProgress > 0 ? `<div class="due-tip" style="background:var(--accent-soft);color:var(--accent)">有 <b>${inProgress}</b> 条进行中，进入后会先继续</div>` : ''}
           </div>
 
           <div class="card">
@@ -328,51 +485,49 @@
             <div class="days-tip">按此进度，约 <b id="daysNum">${days}</b> 天完成全部条文</div>
           </div>
 
-          <button class="btn-main" data-action="goto-select">开始今日任务</button>
+          <button class="btn-main" data-action="goto-subjects">开始今日任务</button>
           <button class="btn-sub" data-action="goto-library">浏览条文库</button>
+
+          <div class="backup-block">
+            <div class="backup-title">存档</div>
+            <div class="backup-row">
+              <button class="backup-btn" data-action="export-data">导出存档</button>
+              <button class="backup-btn" data-action="import-data">导入存档</button>
+            </div>
+            <div class="backup-hint">换设备、换浏览器时导出 JSON，在新设备导入即可恢复</div>
+          </div>
         </main>
       </div>`;
   }
 
-  /* ---------- 科目选择页 ---------- */
-  function viewSelectSubjects() {
-    const allSubjects = [];
-    DATA.levels.forEach(level => {
-      if (level.available === false) return;
-      (level.subjects || []).forEach(s => {
-        allSubjects.push({ levelName: level.name, subject: s });
-      });
-    });
+  /* ---------- 科目页 ---------- */
+  function viewSubjects() {
+    const subjects = getAllSubjects();
 
-    const cards = allSubjects.map(({ subject }) => {
-      const total = subject.passages.length;
-      const mastered = subject.passages.filter(p => isMastered(p.id)).length;
-      const due = subject.passages.filter(p => isDueReview(p.id)).length;
-      const checked = state.selectedSubjects.includes(subject.id);
+    const cards = subjects.map(s => {
+      const st = getSubjectStats(s);
+      const pct = st.total ? Math.round(st.mastered / st.total * 100) : 0;
+
+      const parts = [];
+      if (st.unfinished > 0) parts.push(`${st.unfinished} 未完成`);
+      if (st.freshPlanned > 0) parts.push(`${st.freshPlanned} 新学`);
+      if (st.due > 0) parts.push(`${st.due} 复习`);
+      const breakdown = parts.length ? parts.join(' · ') : '今日无任务';
+
       return `
-        <label class="subject-select ${checked ? 'checked' : ''}">
-          <input type="checkbox" data-subject="${subject.id}" ${checked ? 'checked' : ''}>
-          <span class="sc-check"></span>
-          <span class="sc-icon">${subject.icon || '📖'}</span>
+        <button class="subject-card" data-action="start-subject" data-subject="${s.id}" style="padding:16px">
+          <span class="sc-icon">${s.icon || '📖'}</span>
           <span class="sc-body">
-            <span class="sc-name">${esc(subject.name)}</span>
-            <span class="sc-meta">
-              ${mastered}/${total} 已掌握
-              ${due > 0 ? `<b class="due-num"> · ${due} 条待复习</b>` : ''}
-            </span>
+            <span class="sc-name">${esc(s.name)}</span>
+            <span class="sc-meta">${st.mastered} / ${st.total} 已掌握</span>
+            <span class="sc-today">今日 <b>${st.today}</b> 条 · ${breakdown}</span>
+            <span class="sc-bar"><i style="width:${pct}%"></i></span>
           </span>
-        </label>`;
+          <span class="sc-arrow">›</span>
+        </button>`;
     }).join('');
 
-    const selectedSet = new Set(state.selectedSubjects);
-    let totalRemain = 0, totalDue = 0;
-    allSubjects.forEach(({ subject }) => {
-      if (!selectedSet.has(subject.id)) return;
-      totalRemain += subject.passages.filter(p => !isMastered(p.id)).length;
-      totalDue += subject.passages.filter(p => isDueReview(p.id)).length;
-    });
-    const todayCount = Math.min(totalRemain, state.dailyGoal) + totalDue;
-    const canStart = state.selectedSubjects.length > 0;
+    const totalDue = dueReviewList().length;
 
     return `
       <div class="page">
@@ -382,53 +537,44 @@
             <div class="tt-kicker">今日任务</div>
             <div class="tt-name">选择经典</div>
           </div>
-          <button class="btn-all" data-action="toggle-all">
-            ${state.selectedSubjects.length === allSubjects.length ? '全不选' : '全选'}
-          </button>
+          <div class="icon-btn ghost"></div>
         </header>
 
         <main class="list-main">
-          <div class="select-hint">可多选，同时复习多本经典</div>
-          <div class="subject-select-list">${cards}</div>
-        </main>
-
-        <footer class="select-foot">
-          <div class="select-summary">
-            已选 <b>${state.selectedSubjects.length}</b> 本 ·
-            今日约 <b>${todayCount}</b> 条
-            ${totalDue > 0 ? `<span class="due-tag">含 ${totalDue} 条复习</span>` : ''}
+          <div class="select-hint">
+            未完成的优先继续，新学每科最多 ${state.dailyGoal} 条，到期复习自动接在最后
+            ${totalDue > 0 ? `（今日共 ${totalDue} 条待复习）` : ''}
           </div>
-          <button class="btn-main" data-action="confirm-start" ${canStart ? '' : 'disabled'}>
-            ${canStart ? '开始学习' : '请至少选一本'}
-          </button>
-        </footer>
+          <div class="subject-list">${cards}</div>
+        </main>
       </div>`;
   }
 
   /* ---------- 学习页 ---------- */
   function viewLearn() {
     if (!state.currentId) {
-      const hasSel = state.selectedSubjects.length > 0;
       return `
         <div class="page">
           <header class="topbar">
-            <button class="icon-btn" data-action="goto-home">‹</button>
-            <div class="topbar-title"><div class="tt-name">今日任务</div></div>
+            <button class="icon-btn" data-action="goto-subjects">‹</button>
+            <div class="topbar-title"><div class="tt-name">任务完成</div></div>
             <div class="icon-btn ghost"></div>
           </header>
           <main class="learn-main">
             <div class="done-box">
               <div class="done-icon">✓</div>
-              <div class="done-title">${hasSel ? '今日任务已完成' : '未选择经典'}</div>
-              <div class="done-sub">${hasSel ? '明天再来，或去条文库继续学习' : '请返回选择至少一本经典'}</div>
-              <button class="btn-main" data-action="goto-home">返回首页</button>
+              <div class="done-title">本次任务已完成</div>
+              <div class="done-sub">返回选其他经典，或明天再来</div>
+              <button class="btn-main" data-action="goto-subjects">返回经典列表</button>
+              <button class="btn-sub" data-action="goto-home">回到首页</button>
             </div>
           </main>
         </div>`;
     }
 
     const p = PASSAGE_MAP[state.currentId];
-    const idx = state.queue.length;
+    const doneCount = state.queueTotal - state.queue.length + 1;
+    const posLabel = `${doneCount}/${state.queueTotal}`;
 
     let body = '';
     if (state.step === 'overview') body = renderOverview(p);
@@ -439,12 +585,12 @@
     return `
       <div class="page">
         <header class="topbar">
-          <button class="icon-btn" data-action="goto-home">‹</button>
+          <button class="icon-btn" data-action="goto-subjects">‹</button>
           <div class="topbar-title">
             <div class="tt-kicker">${esc(p.subjectName)} · ${esc(p.part || '')}</div>
             <div class="tt-name">${esc(p.article)}</div>
           </div>
-          <div class="queue-badge">${idx}</div>
+          <div class="queue-badge">${posLabel}</div>
         </header>
 
         <div class="step-bar">
@@ -546,7 +692,7 @@
     return '';
   }
 
-  /* ================= 核心：按字分发输入 ================= */
+  /* ================= 核心：输入处理 ================= */
   function isClozeInput(el) {
     return el && el.tagName === 'INPUT' && el.classList.contains('blank')
            && el.closest('#clozeBox');
@@ -569,26 +715,85 @@
     if (inputs.length) try { inputs[inputs.length - 1].focus(); } catch (e) {}
   }
 
+  function setInputValue(inp, val) {
+    inp.value = val;
+    inp.dataset.prevValue = val;
+  }
+
+  function distributeFrom(str, startIdx, inputs) {
+    const chars = Array.from(str);
+    let cursor = startIdx;
+    for (const ch of chars) {
+      if (cursor >= inputs.length) break;
+      setInputValue(inputs[cursor], ch);
+      inputs[cursor].classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
+      cursor++;
+    }
+    focusFirstEmpty(cursor);
+  }
+
+  /**
+   * 输入分发逻辑：
+   * - 当前空为空：从当前空开始依次铺新字
+   * - 当前空已有字：把当前空替换为新输入的第一个字，其余依次铺后续空
+   *   → 无论光标在字前还是字后，点击已填过的空再输入，都会替换这个空
+   *   → 想只修改当前空：直接输入新字即可
+   *   → 想清空当前空：退格删除
+   */
   function distributeInput(inp) {
     const inputs = getClozeInputs();
     const startIdx = inputs.indexOf(inp);
     if (startIdx < 0) return;
 
-    let raw = inp.value || '';
-    raw = raw.replace(/\s+/g, '');
-    if (!raw) return;
+    const raw = (inp.value || '').replace(/\s+/g, '');
+    const prev = inp.dataset.prevValue || '';
 
-    const chars = Array.from(raw);
+    if (raw === prev) return;
 
-    let cursor = startIdx;
-    for (const ch of chars) {
-      if (cursor >= inputs.length) break;
-      inputs[cursor].value = ch;
-      inputs[cursor].classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
-      cursor++;
+    // 用户清空
+    if (!raw) {
+      inp.dataset.prevValue = '';
+      return;
     }
 
-    focusFirstEmpty(cursor);
+    // 计算「本次输入的新字」
+    let incoming = '';
+    if (!prev) {
+      // 之前是空的 → 全部是新字
+      incoming = raw;
+    } else if (raw.length > prev.length) {
+      // 变长了 → 取出新增部分（前置或后置都算）
+      if (raw.startsWith(prev)) incoming = raw.slice(prev.length);
+      else if (raw.endsWith(prev)) incoming = raw.slice(0, raw.length - prev.length);
+      else incoming = raw; // 完全替换
+    } else if (raw.length < prev.length) {
+      // 变短了 → 用户在删除，不做分发
+      inp.dataset.prevValue = raw;
+      return;
+    } else {
+      // 等长 → 替换
+      incoming = raw;
+    }
+
+    if (!incoming) {
+      inp.dataset.prevValue = raw;
+      return;
+    }
+
+    const incomingChars = Array.from(incoming);
+    const first = incomingChars[0];
+
+    // 当前空固定放新输入的第一个字
+    setInputValue(inp, first);
+    inp.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
+
+    if (incomingChars.length > 1) {
+      // 其余字依次铺到后续空
+      distributeFrom(incomingChars.slice(1).join(''), startIdx + 1, inputs);
+    } else {
+      // 只有一个字，光标跳到下一个空
+      focusFirstEmpty(startIdx + 1);
+    }
   }
 
   document.addEventListener('input', function (e) {
@@ -635,7 +840,7 @@
     const inputs = getClozeInputs();
     inputs.forEach(inp => {
       const uv = inp.dataset.userValue;
-      if (uv !== undefined) inp.value = uv;
+      if (uv !== undefined) setInputValue(inp, uv);
       inp.classList.remove('hint-wrong');
       inp.removeAttribute('readonly');
       delete inp.dataset.userValue;
@@ -648,7 +853,7 @@
     if (state.hintOn) {
       inputs.forEach(inp => {
         const uv = inp.dataset.userValue;
-        if (uv !== undefined) inp.value = uv;
+        if (uv !== undefined) setInputValue(inp, uv);
         inp.classList.remove('hint-wrong');
         inp.removeAttribute('readonly');
         delete inp.dataset.userValue;
@@ -661,6 +866,7 @@
         const val = normalize(inp.value);
         if (val !== ans) {
           inp.value = inp.dataset.answer;
+          inp.dataset.prevValue = inp.dataset.answer;
           inp.classList.add('hint-wrong');
         }
         inp.setAttribute('readonly', 'readonly');
@@ -687,8 +893,9 @@
         render();
         break;
 
-      case 'goto-select':
-        state.screen = 'select-subjects';
+      case 'goto-subjects':
+        state.screen = 'subjects';
+        state.locking = false;
         render();
         break;
 
@@ -698,34 +905,34 @@
         render();
         break;
 
-      case 'toggle-all': {
-        const allIds = getAllSubjectIds();
-        if (state.selectedSubjects.length === allIds.length) {
-          state.selectedSubjects = [];
-        } else {
-          state.selectedSubjects = allIds.slice();
-        }
-        save();
-        render();
-        break;
-      }
-
-      case 'confirm-start':
-        if (!state.selectedSubjects.length) break;
-        startLearn();
+      case 'start-subject':
+        startSubject(el.dataset.subject);
         break;
 
+      case 'export-data':
+        exportData();
+        break;
+
+      case 'import-data':
+        triggerImport();
+        break;
+
+      /* ---- 总览 ---- */
       case 'know':
+        setStage(state.currentId, 'choice');
         state.step = 'choice';
         state.choice = null;
         state.choiceSeed = 0;
         state.feedback = null;
         state.pickedOption = null;
-        state.hintOn = false;
         render();
         break;
-      case 'skip': skipCurrent(); break;
 
+      case 'skip':
+        skipCurrent();
+        break;
+
+      /* ---- 选择题 ---- */
       case 'pick-option': {
         state.pickedOption = el.dataset.value;
         state.feedback = null;
@@ -752,6 +959,7 @@
         });
         if (ok) {
           state.locking = true;
+          setStage(state.currentId, 'cloze');
           state.feedback = { type: 'ok', text: '答对了，进入挖空填空' };
           updateFeedback('ok', '答对了，进入挖空填空');
           updateFoot();
@@ -803,6 +1011,7 @@
         if (wrong === 0) {
           state.locking = true;
           if (state.step === 'cloze') {
+            setStage(state.currentId, 'full');
             state.feedback = { type: 'ok', text: '全对！进入默写' };
             updateFeedback('ok', '全对！进入默写');
             updateFoot();
@@ -814,12 +1023,13 @@
               render();
             }, 700);
           } else {
+            markMastered(state.currentId);
             state.feedback = { type: 'ok', text: '全对！本条已掌握' };
             updateFeedback('ok', '全对！本条已掌握');
             updateFoot();
             setTimeout(() => {
               state.locking = false;
-              completeCurrent();
+              advanceQueue();
             }, 800);
           }
         } else {
@@ -835,6 +1045,7 @@
         if (state.hintOn) { clearHint(); }
         document.querySelectorAll('#clozeBox input.blank').forEach(inp => {
           inp.value = '';
+          inp.dataset.prevValue = '';
           inp.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
           inp.removeAttribute('readonly');
           delete inp.dataset.userValue;
@@ -848,6 +1059,7 @@
         break;
       }
 
+      /* ---- 浏览 ---- */
       case 'view-subject':
         state.viewSubjectId = el.dataset.subject;
         render();
@@ -857,9 +1069,11 @@
         else { state.screen = 'home'; render(); }
         break;
       case 'view-passage':
+        state.subjectId = PASSAGE_MAP[el.dataset.passage].subjectId;
+        state.queue = [el.dataset.passage];
+        state.queueTotal = 1;
         state.currentId = el.dataset.passage;
-        state.queue = [state.currentId];
-        state.step = 'overview';
+        restoreStep();
         state.choice = null;
         state.feedback = null;
         state.pickedOption = null;
@@ -882,18 +1096,6 @@
     }
   });
 
-  document.addEventListener('change', function (e) {
-    const cb = e.target;
-    if (cb && cb.matches && cb.matches('input[data-subject]')) {
-      const id = cb.dataset.subject;
-      const idx = state.selectedSubjects.indexOf(id);
-      if (cb.checked && idx < 0) state.selectedSubjects.push(id);
-      else if (!cb.checked && idx >= 0) state.selectedSubjects.splice(idx, 1);
-      save();
-      render();
-    }
-  });
-
   /* ================= 条文库 ================= */
   function viewLibrary() {
     const lv = DATA.levels.find(l => l.id === state.viewLevelId);
@@ -901,13 +1103,12 @@
 
     if (!state.viewSubjectId) {
       const cards = lv.subjects.map(s => {
-        const total = s.passages.length;
-        const done = s.passages.filter(p => isMastered(p.id)).length;
+        const st = getSubjectStats(s);
         return `<button class="subject-card" data-action="view-subject" data-subject="${s.id}">
           <span class="sc-icon">${s.icon || '📖'}</span>
           <span class="sc-body">
             <span class="sc-name">${esc(s.name)}</span>
-            <span class="sc-meta">${done} / ${total} 已掌握</span>
+            <span class="sc-meta">${st.mastered} / ${st.total} 已掌握</span>
           </span>
           <span class="sc-arrow">›</span>
         </button>`;
@@ -929,15 +1130,20 @@
     if (!subject) return viewHome();
     const items = subject.passages.map(p => {
       const pr = state.progress[p.id];
-      const status = pr && pr.stage === 'mastered'
-        ? (isDueReview(p.id) ? '<span class="tag due">待复习</span>' : '<span class="tag done">已掌握</span>')
-        : '<span class="tag">未学</span>';
+      let tag = '<span class="tag">未学</span>';
+      if (pr && pr.stage === 'mastered') {
+        tag = isDueReview(p.id)
+          ? '<span class="tag due">待复习</span>'
+          : '<span class="tag done">已掌握</span>';
+      } else if (pr && (pr.stage === 'choice' || pr.stage === 'cloze' || pr.stage === 'full')) {
+        tag = '<span class="tag due">进行中</span>';
+      }
       return `<button class="passage-item" data-action="view-passage" data-passage="${p.id}">
         <span class="pi-main">
           <span class="pi-title">${esc(p.title)}</span>
           <span class="pi-article">${esc(p.article)}</span>
         </span>
-        ${status}
+        ${tag}
       </button>`;
     }).join('');
     return `
