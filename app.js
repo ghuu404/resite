@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v3.4
-   输入一串字 → 自动按字拆开，依次填入后续空
+   app.js — 经典条文背诵 v3.5
+   提示开关：点一下显示正确答案（错标红、对不变），再点恢复
    ============================================================ */
 (function () {
   'use strict';
@@ -136,6 +136,7 @@
     feedback: null,
     pickedOption: null,
     locking: false,
+    hintOn: false,
     viewLevelId: 'L1',
     viewSubjectId: null,
   };
@@ -200,6 +201,7 @@
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
+    state.hintOn = false;
     state.screen = 'learn';
     render();
   }
@@ -214,6 +216,7 @@
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
+    state.hintOn = false;
     render();
   }
 
@@ -232,6 +235,7 @@
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
+    state.hintOn = false;
     render();
   }
 
@@ -246,7 +250,7 @@
     if (state.screen === 'learn' && (state.step === 'cloze' || state.step === 'full')) {
       setTimeout(() => {
         const b = document.querySelector('#clozeBox input.blank');
-        if (b) try { b.focus(); } catch(e){}
+        if (b && !state.hintOn) try { b.focus(); } catch(e){}
       }, 80);
     }
   }
@@ -490,7 +494,7 @@
     const mask = buildMask(p.text, 'partial', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">补全空缺处。可直接输入一整串字，系统会按字自动填入后续空</div>
+      <div class="hint-row">补全空缺处。可连续输入，系统会按字自动填入后续空</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -499,7 +503,7 @@
     const mask = buildMask(p.text, 'full', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">默写全文。可连续输入，系统会按字填入，标点已给出</div>
+      <div class="hint-row">默写全文。可连续输入，标点已给出</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -526,8 +530,9 @@
           <button class="btn-ghost" data-action="skip">跳过</button>
           <button class="btn-main" data-action="retry-cloze">重试</button>`;
       }
+      const hintLabel = state.hintOn ? '关闭提示' : '提示';
       return `
-        <button class="btn-ghost" data-action="reveal">显示答案</button>
+        <button class="btn-ghost" data-action="toggle-hint">${hintLabel}</button>
         <button class="btn-main" data-action="check-cloze">检查</button>`;
     }
     return '';
@@ -550,45 +555,38 @@
     for (let i = fromIdx; i < inputs.length; i++) {
       if (!inputs[i].value) { try { inputs[i].focus(); } catch (e) {} return; }
     }
-    // 从 fromIdx 往后没有空的，从头找
     for (let i = 0; i < inputs.length; i++) {
       if (!inputs[i].value) { try { inputs[i].focus(); } catch (e) {} return; }
     }
-    // 全填满，聚焦最后一个
     if (inputs.length) try { inputs[inputs.length - 1].focus(); } catch (e) {}
   }
 
-  // 把 inp 里的字符串按字拆开，从 inp 所在位置开始依次填入后续空
   function distributeInput(inp) {
     const inputs = getClozeInputs();
     const startIdx = inputs.indexOf(inp);
     if (startIdx < 0) return;
 
     let raw = inp.value || '';
-    // 去掉所有空白
     raw = raw.replace(/\s+/g, '');
     if (!raw) return;
 
     const chars = Array.from(raw);
 
-    // 从 startIdx 开始依次覆盖填入
     let cursor = startIdx;
     for (const ch of chars) {
       if (cursor >= inputs.length) break;
       inputs[cursor].value = ch;
-      inputs[cursor].classList.remove('correct', 'wrong', 'revealed');
+      inputs[cursor].classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
       cursor++;
     }
 
-    // 光标跳到 cursor 之后第一个未填的空
     focusFirstEmpty(cursor);
   }
 
-  /* ---- input 事件 ---- */
   document.addEventListener('input', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
-    // 输入法合成中，不处理，等 compositionend
+    if (state.hintOn) return;  // 提示开启时不响应输入
     if (e.isComposing || inp.dataset.composing === '1') return;
     distributeInput(inp);
   }, true);
@@ -602,13 +600,14 @@
     const inp = e.target;
     if (!isClozeInput(inp)) return;
     inp.dataset.composing = '';
+    if (state.hintOn) return;
     distributeInput(inp);
   }, true);
 
-  /* ---- 退格跳上一空，回车跳下一空 ---- */
   document.addEventListener('keydown', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
+    if (state.hintOn) return;
     if (e.key === 'Enter') {
       e.preventDefault();
       const inputs = getClozeInputs();
@@ -621,6 +620,53 @@
       if (idx > 0) { try { inputs[idx - 1].focus(); } catch (err) {} }
     }
   }, true);
+
+  /* ================= 提示开关 ================= */
+  function clearHint() {
+    if (!state.hintOn) return;
+    const inputs = getClozeInputs();
+    inputs.forEach(inp => {
+      const uv = inp.dataset.userValue;
+      if (uv !== undefined) inp.value = uv;
+      inp.classList.remove('hint-wrong');
+      inp.removeAttribute('readonly');
+      delete inp.dataset.userValue;
+    });
+    state.hintOn = false;
+  }
+
+  function toggleHint() {
+    const inputs = getClozeInputs();
+    if (state.hintOn) {
+      // 关闭：恢复用户输入
+      inputs.forEach(inp => {
+        const uv = inp.dataset.userValue;
+        if (uv !== undefined) inp.value = uv;
+        inp.classList.remove('hint-wrong');
+        inp.removeAttribute('readonly');
+        delete inp.dataset.userValue;
+      });
+      state.hintOn = false;
+    } else {
+      // 打开：把当前值存起来，错的显示正确答案并标红，对的保持原样
+      inputs.forEach(inp => {
+        inp.dataset.userValue = inp.value;
+        const ans = normalize(inp.dataset.answer);
+        const val = normalize(inp.value);
+        if (val !== ans) {
+          inp.value = inp.dataset.answer;
+          inp.classList.add('hint-wrong');
+        }
+        inp.setAttribute('readonly', 'readonly');
+      });
+      state.hintOn = true;
+    }
+    updateFoot();
+    // 提示开启时收起键盘
+    if (state.hintOn) {
+      try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch (e) {}
+    }
+  }
 
   /* ================= 事件 ================= */
   document.addEventListener('click', function (e) {
@@ -670,6 +716,7 @@
         state.choiceSeed = 0;
         state.feedback = null;
         state.pickedOption = null;
+        state.hintOn = false;
         render();
         break;
       case 'skip': skipCurrent(); break;
@@ -708,6 +755,7 @@
             state.feedback = null;
             state.pickedOption = null;
             state.locking = false;
+            state.hintOn = false;
             render();
           }, 700);
         } else {
@@ -727,8 +775,16 @@
         render();
         break;
 
+      case 'toggle-hint':
+        if (state.locking) break;
+        toggleHint();
+        break;
+
       case 'check-cloze': {
         if (state.locking) break;
+        // 若开了提示，先关掉（恢复用户输入），再检查
+        if (state.hintOn) { clearHint(); updateFoot(); }
+
         const box = document.getElementById('clozeBox');
         if (!box) break;
         const inputs = Array.from(box.querySelectorAll('input.blank'));
@@ -736,7 +792,7 @@
         inputs.forEach(inp => {
           const ans = normalize(inp.dataset.answer);
           const val = normalize(inp.value);
-          inp.classList.remove('correct', 'wrong', 'revealed');
+          inp.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
           if (val && val === ans) inp.classList.add('correct');
           else { inp.classList.add('wrong'); wrong++; }
         });
@@ -750,6 +806,7 @@
               state.step = 'full';
               state.feedback = null;
               state.locking = false;
+              state.hintOn = false;
               render();
             }, 700);
           } else {
@@ -769,24 +826,15 @@
         break;
       }
 
-      case 'reveal': {
-        if (state.locking) break;
-        document.querySelectorAll('#clozeBox input.blank').forEach(inp => {
-          inp.value = inp.dataset.answer;
-          inp.classList.add('revealed');
-          inp.classList.remove('wrong', 'correct');
-        });
-        state.feedback = { type: 'bad', text: '已显示答案，请仔细核对后重试' };
-        updateFeedback('bad', '已显示答案，请仔细核对后重试');
-        updateFoot();
-        break;
-      }
-
       case 'retry-cloze': {
         if (state.locking) break;
+        // 关掉提示，清空所有输入
+        if (state.hintOn) { clearHint(); }
         document.querySelectorAll('#clozeBox input.blank').forEach(inp => {
           inp.value = '';
-          inp.classList.remove('correct', 'wrong', 'revealed');
+          inp.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
+          inp.removeAttribute('readonly');
+          delete inp.dataset.userValue;
         });
         state.feedback = null;
         const fb = document.getElementById('feedbackMsg');
@@ -813,6 +861,7 @@
         state.feedback = null;
         state.pickedOption = null;
         state.locking = false;
+        state.hintOn = false;
         state.screen = 'learn';
         render();
         break;

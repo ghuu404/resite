@@ -120,7 +120,7 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
 }
 .sc-check {
   width: 20px; height: 20px; flex: 0 0 auto;
-  border: 1.8px solid var(--line-2, #ded6c9); border-radius: 6px;
+  border: 1.8px solid #ded6c9; border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
   background: var(--surface); transition: all .15s;
 }
@@ -144,7 +144,6 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   position: sticky; bottom: 0; left: 0; right: 0;
   padding: 12px 18px calc(14px + env(safe-area-inset-bottom, 0px));
   background: linear-gradient(rgba(250,248,244,0), var(--bg) 40%);
-  border-top: 1px solid transparent;
 }
 .select-summary {
   font-size: 13px; color: var(--ink-2); margin-bottom: 10px; text-align: center;
@@ -214,6 +213,14 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   background: var(--red-soft); }
 .blank.revealed { color: var(--gold); border-bottom-color: var(--gold);
   background: #fdf7e8; }
+
+/* 提示开启时：错的标红，对的无变化 */
+.blank.hint-wrong {
+  color: var(--red);
+  border-bottom-color: var(--red);
+  background: var(--red-soft);
+}
+.blank[readonly] { cursor: default; }
 
 .feedback { margin-top: 18px; padding: 12px 14px; border-radius: 10px;
   font-size: 14px; }
