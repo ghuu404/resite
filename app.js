@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v3.5
-   提示开关：点一下显示正确答案（错标红、对不变），再点恢复
+   app.js — 经典条文背诵 v3.6
+   挖空：精确挖去 50% 非标点字
    ============================================================ */
 (function () {
   'use strict';
@@ -49,11 +49,19 @@
       return mask;
     }
 
-    const rng = mulberry32(hashStr(seed + '::partial'));
+    // partial：精确挖去 50% 的非标点字
+    const candidates = [];
     for (let i = 0; i < chars.length; i++) {
-      if (isPunct(chars[i])) continue;
-      if (rng() < 0.6) mask[i] = ++gid;
+      if (!isPunct(chars[i])) candidates.push(i);
     }
+    const total = candidates.length;
+    const blankCount = Math.max(1, Math.round(total * 0.5));
+
+    const rng = mulberry32(hashStr(seed + '::partial'));
+    const shuffled = shuffle(candidates.slice(), rng);
+    const chosen = shuffled.slice(0, blankCount);
+    chosen.sort((a, b) => a - b);
+    chosen.forEach(idx => { mask[idx] = ++gid; });
     return mask;
   }
 
@@ -494,7 +502,7 @@
     const mask = buildMask(p.text, 'partial', p.id);
     return `
       <div class="passage-title">${esc(p.title)}</div>
-      <div class="hint-row">补全空缺处。可连续输入，系统会按字自动填入后续空</div>
+      <div class="hint-row">补全空缺处（挖去 50% 的字）。可连续输入，系统按字自动填入</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
@@ -586,7 +594,7 @@
   document.addEventListener('input', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
-    if (state.hintOn) return;  // 提示开启时不响应输入
+    if (state.hintOn) return;
     if (e.isComposing || inp.dataset.composing === '1') return;
     distributeInput(inp);
   }, true);
@@ -638,7 +646,6 @@
   function toggleHint() {
     const inputs = getClozeInputs();
     if (state.hintOn) {
-      // 关闭：恢复用户输入
       inputs.forEach(inp => {
         const uv = inp.dataset.userValue;
         if (uv !== undefined) inp.value = uv;
@@ -648,7 +655,6 @@
       });
       state.hintOn = false;
     } else {
-      // 打开：把当前值存起来，错的显示正确答案并标红，对的保持原样
       inputs.forEach(inp => {
         inp.dataset.userValue = inp.value;
         const ans = normalize(inp.dataset.answer);
@@ -662,7 +668,6 @@
       state.hintOn = true;
     }
     updateFoot();
-    // 提示开启时收起键盘
     if (state.hintOn) {
       try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch (e) {}
     }
@@ -782,7 +787,6 @@
 
       case 'check-cloze': {
         if (state.locking) break;
-        // 若开了提示，先关掉（恢复用户输入），再检查
         if (state.hintOn) { clearHint(); updateFoot(); }
 
         const box = document.getElementById('clozeBox');
@@ -828,7 +832,6 @@
 
       case 'retry-cloze': {
         if (state.locking) break;
-        // 关掉提示，清空所有输入
         if (state.hintOn) { clearHint(); }
         document.querySelectorAll('#clozeBox input.blank').forEach(inp => {
           inp.value = '';
