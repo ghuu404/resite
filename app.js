@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v4.3
-   修复：已填过的空再次输入时直接替换该空，与光标位置无关
+   app.js — 经典条文背诵 v4.6
+   修复：当天队列持久化，退出再进恢复进度
    ============================================================ */
 (function () {
   'use strict';
@@ -120,6 +120,7 @@
 
   /* ================= 状态 ================= */
   const STORAGE_KEY = 'jingdian-v4';
+  const SESSION_KEY = 'jingdian-session-v1';
 
   function getAllSubjects() {
     const out = [];
@@ -138,6 +139,15 @@
     return found;
   }
 
+  function newMaskSeed() {
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function todayKey() {
+    const d = new Date();
+    return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
+  }
+
   const state = {
     screen: 'home',
     dailyGoal: 10,
@@ -146,7 +156,9 @@
     queue: [],
     queueTotal: 0,
     currentId: null,
+    currentMode: 'learn',
     step: 'overview',
+    maskSeed: '',
     choice: null,
     choiceSeed: 0,
     feedback: null,
@@ -171,6 +183,30 @@
         progress: state.progress
       }));
     } catch (e) {}
+  }
+
+  /* ================= 当天会话持久化 ================= */
+  function saveSession() {
+    try {
+      if (!state.subjectId) return;
+      if (!state.queueTotal) return;
+      localStorage.setItem(SESSION_KEY, JSON.stringify({
+        date: todayKey(),
+        subjectId: state.subjectId,
+        queue: state.queue,
+        total: state.queueTotal
+      }));
+    } catch (e) {}
+  }
+
+  function loadSession() {
+    try {
+      return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    } catch (e) { return null; }
+  }
+
+  function clearSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
   }
 
   function showToast(text, type) {
@@ -248,11 +284,13 @@
       const pr = state.progress[p.id];
       const stage = pr ? pr.stage : 'new';
       if (stage === 'mastered') {
-        if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) due.push(p.id);
+        if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) {
+          due.push({ id: p.id, mode: 'review' });
+        }
       } else if (stage === 'new' || !stage) {
-        fresh.push(p.id);
+        fresh.push({ id: p.id, mode: 'learn' });
       } else {
-        unfinished.push(p.id);
+        unfinished.push({ id: p.id, mode: 'learn' });
       }
     });
 
@@ -266,60 +304,114 @@
   function restoreStep() {
     const pr = state.progress[state.currentId];
     const stage = pr ? pr.stage : 'new';
-    if (stage === 'choice' || stage === 'cloze' || stage === 'full') {
-      state.step = stage;
+
+    if (state.currentMode === 'review') {
+      if (stage === 'full') state.step = 'full';
+      else state.step = 'cloze';
     } else {
-      state.step = 'overview';
+      if (stage === 'choice' || stage === 'cloze' || stage === 'full') {
+        state.step = stage;
+      } else {
+        state.step = 'overview';
+      }
     }
+
+    state.maskSeed = newMaskSeed();
   }
 
   function startSubject(subjectId) {
     state.subjectId = subjectId;
-    state.queue = buildQueueForSubject(subjectId);
-    state.queueTotal = state.queue.length;
     state.choice = null;
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
     state.hintOn = false;
 
+    // 尝试恢复今天的会话
+    const today = todayKey();
+    const saved = loadSession();
+    let restored = false;
+
+    if (saved
+        && saved.date === today
+        && saved.subjectId === subjectId
+        && Array.isArray(saved.queue)
+        && saved.queue.length > 0) {
+      // 过滤掉已经被掌握（可能在其他地方做完）的条目
+      const validQueue = saved.queue.filter(x => {
+        if (!PASSAGE_MAP[x.id]) return false;
+        if (x.mode === 'learn') {
+          // learn 模式下若已 mastered 就不再需要了
+          return !isMastered(x.id);
+        }
+        return true;
+      });
+      if (validQueue.length > 0) {
+        state.queue = validQueue;
+        state.queueTotal = Math.max(saved.total || validQueue.length, validQueue.length);
+        restored = true;
+      }
+    }
+
+    if (!restored) {
+      state.queue = buildQueueForSubject(subjectId);
+      state.queueTotal = state.queue.length;
+    }
+
     if (!state.queue.length) {
       state.currentId = null;
+      state.currentMode = 'learn';
+      clearSession();
       state.screen = 'learn';
       render();
       return;
     }
 
-    state.currentId = state.queue[0];
+    state.currentId = state.queue[0].id;
+    state.currentMode = state.queue[0].mode;
     restoreStep();
     state.screen = 'learn';
+    saveSession();
     render();
   }
 
   function skipCurrent() {
     if (state.queue.length <= 1) return;
-    const id = state.queue.shift();
-    state.queue.push(id);
-    state.currentId = state.queue[0];
+    const item = state.queue.shift();
+    state.queue.push(item);
+    state.currentId = state.queue[0].id;
+    state.currentMode = state.queue[0].mode;
     state.choice = null;
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
     state.hintOn = false;
     restoreStep();
+    saveSession();
     render();
   }
 
   function advanceQueue() {
-    state.queue = state.queue.filter(x => x !== state.currentId);
-    state.currentId = state.queue[0] || null;
+    state.queue = state.queue.filter(x => x.id !== state.currentId);
+    if (state.queue.length) {
+      state.currentId = state.queue[0].id;
+      state.currentMode = state.queue[0].mode;
+    } else {
+      state.currentId = null;
+      state.currentMode = 'learn';
+      state.step = 'overview';
+    }
     state.choice = null;
     state.feedback = null;
     state.pickedOption = null;
     state.locking = false;
     state.hintOn = false;
-    if (state.currentId) restoreStep();
-    else state.step = 'overview';
+    if (state.currentId) {
+      restoreStep();
+      saveSession();
+    } else {
+      clearSession();
+    }
     render();
   }
 
@@ -446,6 +538,18 @@
       if (pr && (pr.stage === 'choice' || pr.stage === 'cloze' || pr.stage === 'full')) inProgress++;
     });
 
+    // 查看今天是否有未完成会话
+    let sessionTip = '';
+    const saved = loadSession();
+    if (saved && saved.date === todayKey() && Array.isArray(saved.queue) && saved.queue.length > 0) {
+      const subj = findSubject(saved.subjectId);
+      if (subj) {
+        sessionTip = `<div class="due-tip" style="background:var(--green-soft);color:var(--green)">
+          今日「${esc(subj.name)}」还有 <b>${saved.queue.length}</b> 条未完成
+        </div>`;
+      }
+    }
+
     return `
       <div class="page">
         <header class="home-head">
@@ -472,7 +576,8 @@
               </div>
             </div>
             ${due > 0 ? `<div class="due-tip">有 <b>${due}</b> 条待复习</div>` : ''}
-            ${inProgress > 0 ? `<div class="due-tip" style="background:var(--accent-soft);color:var(--accent)">有 <b>${inProgress}</b> 条进行中，进入后会先继续</div>` : ''}
+            ${sessionTip}
+            ${inProgress > 0 && !sessionTip ? `<div class="due-tip" style="background:var(--accent-soft);color:var(--accent)">有 <b>${inProgress}</b> 条进行中，进入后会先继续</div>` : ''}
           </div>
 
           <div class="card">
@@ -503,16 +608,27 @@
   /* ---------- 科目页 ---------- */
   function viewSubjects() {
     const subjects = getAllSubjects();
+    const saved = loadSession();
+    const today = todayKey();
 
     const cards = subjects.map(s => {
       const st = getSubjectStats(s);
       const pct = st.total ? Math.round(st.mastered / st.total * 100) : 0;
 
+      // 若今天这个科目有未完成会话，用会话里的剩余数量替代
+      let todayCount = st.today;
+      let breakdown;
       const parts = [];
       if (st.unfinished > 0) parts.push(`${st.unfinished} 未完成`);
       if (st.freshPlanned > 0) parts.push(`${st.freshPlanned} 新学`);
       if (st.due > 0) parts.push(`${st.due} 复习`);
-      const breakdown = parts.length ? parts.join(' · ') : '今日无任务';
+      breakdown = parts.length ? parts.join(' · ') : '今日无任务';
+
+      if (saved && saved.date === today && saved.subjectId === s.id
+          && Array.isArray(saved.queue) && saved.queue.length > 0) {
+        todayCount = saved.queue.length;
+        breakdown = '今日未完成，进入继续';
+      }
 
       return `
         <button class="subject-card" data-action="start-subject" data-subject="${s.id}" style="padding:16px">
@@ -520,7 +636,7 @@
           <span class="sc-body">
             <span class="sc-name">${esc(s.name)}</span>
             <span class="sc-meta">${st.mastered} / ${st.total} 已掌握</span>
-            <span class="sc-today">今日 <b>${st.today}</b> 条 · ${breakdown}</span>
+            <span class="sc-today">今日 <b>${todayCount}</b> 条 · ${breakdown}</span>
             <span class="sc-bar"><i style="width:${pct}%"></i></span>
           </span>
           <span class="sc-arrow">›</span>
@@ -575,6 +691,7 @@
     const p = PASSAGE_MAP[state.currentId];
     const doneCount = state.queueTotal - state.queue.length + 1;
     const posLabel = `${doneCount}/${state.queueTotal}`;
+    const isReview = state.currentMode === 'review';
 
     let body = '';
     if (state.step === 'overview') body = renderOverview(p);
@@ -582,23 +699,35 @@
     else if (state.step === 'cloze') body = renderClozeStep(p);
     else if (state.step === 'full') body = renderFullStep(p);
 
+    const steps = isReview
+      ? [{ k: 'cloze', label: '空' }, { k: 'full', label: '默' }]
+      : [
+          { k: 'overview', label: '览' },
+          { k: 'choice', label: '选' },
+          { k: 'cloze', label: '空' },
+          { k: 'full', label: '默' }
+        ];
+
+    const stepBar = steps.map(s => {
+      const active = state.step === s.k ? 'active' : '';
+      const done = stepDone(s.k) ? 'done' : '';
+      return `<div class="step-dot ${active} ${done}">${s.label}</div>`;
+    }).join('');
+
+    const reviewTag = isReview ? '<span class="review-tag">复习</span>' : '';
+
     return `
       <div class="page">
         <header class="topbar">
           <button class="icon-btn" data-action="goto-subjects">‹</button>
           <div class="topbar-title">
-            <div class="tt-kicker">${esc(p.subjectName)} · ${esc(p.part || '')}</div>
+            <div class="tt-kicker">${esc(p.subjectName)} · ${esc(p.part || '')}${reviewTag}</div>
             <div class="tt-name">${esc(p.article)}</div>
           </div>
           <div class="queue-badge">${posLabel}</div>
         </header>
 
-        <div class="step-bar">
-          ${['overview','choice','cloze','full'].map(s => `
-            <div class="step-dot ${state.step === s ? 'active' : ''} ${stepDone(s) ? 'done' : ''}">
-              ${({overview:'览',choice:'选',cloze:'空',full:'默'})[s]}
-            </div>`).join('')}
-        </div>
+        <div class="step-bar">${stepBar}</div>
 
         <main class="learn-body">${body}</main>
 
@@ -607,6 +736,10 @@
   }
 
   function stepDone(s) {
+    if (state.currentMode === 'review') {
+      const order = ['cloze', 'full'];
+      return order.indexOf(state.step) > order.indexOf(s);
+    }
     const order = ['overview', 'choice', 'cloze', 'full'];
     return order.indexOf(state.step) > order.indexOf(s);
   }
@@ -645,7 +778,7 @@
   }
 
   function renderClozeStep(p) {
-    const mask = buildMask(p.text, 'partial', p.id);
+    const mask = buildMask(p.text, 'partial', state.maskSeed || String(Date.now()));
     return `
       <div class="passage-title">${esc(p.title)}</div>
       <div class="hint-row">补全空缺处（挖去 50% 的字）。可连续输入，系统按字自动填入</div>
@@ -720,78 +853,58 @@
     inp.dataset.prevValue = val;
   }
 
-  function distributeFrom(str, startIdx, inputs) {
-    const chars = Array.from(str);
-    let cursor = startIdx;
-    for (const ch of chars) {
-      if (cursor >= inputs.length) break;
-      setInputValue(inputs[cursor], ch);
-      inputs[cursor].classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
-      cursor++;
-    }
-    focusFirstEmpty(cursor);
-  }
-
-  /**
-   * 输入分发逻辑：
-   * - 当前空为空：从当前空开始依次铺新字
-   * - 当前空已有字：把当前空替换为新输入的第一个字，其余依次铺后续空
-   *   → 无论光标在字前还是字后，点击已填过的空再输入，都会替换这个空
-   *   → 想只修改当前空：直接输入新字即可
-   *   → 想清空当前空：退格删除
-   */
-  function distributeInput(inp) {
-    const inputs = getClozeInputs();
-    const startIdx = inputs.indexOf(inp);
-    if (startIdx < 0) return;
+  function handleInput(inp) {
+    if (!isClozeInput(inp)) return;
+    if (state.hintOn) return;
 
     const raw = (inp.value || '').replace(/\s+/g, '');
     const prev = inp.dataset.prevValue || '';
 
     if (raw === prev) return;
 
-    // 用户清空
-    if (!raw) {
-      inp.dataset.prevValue = '';
-      return;
-    }
+    if (!raw) { inp.dataset.prevValue = ''; return; }
 
-    // 计算「本次输入的新字」
     let incoming = '';
     if (!prev) {
-      // 之前是空的 → 全部是新字
       incoming = raw;
     } else if (raw.length > prev.length) {
-      // 变长了 → 取出新增部分（前置或后置都算）
       if (raw.startsWith(prev)) incoming = raw.slice(prev.length);
       else if (raw.endsWith(prev)) incoming = raw.slice(0, raw.length - prev.length);
-      else incoming = raw; // 完全替换
+      else incoming = raw;
     } else if (raw.length < prev.length) {
-      // 变短了 → 用户在删除，不做分发
-      inp.dataset.prevValue = raw;
-      return;
+      if (prev.indexOf(raw) >= 0) {
+        inp.dataset.prevValue = raw;
+        return;
+      }
+      incoming = raw;
     } else {
-      // 等长 → 替换
       incoming = raw;
     }
 
-    if (!incoming) {
-      inp.dataset.prevValue = raw;
-      return;
-    }
+    if (!incoming) { inp.dataset.prevValue = raw; return; }
 
-    const incomingChars = Array.from(incoming);
+    const incomingChars = Array.from(incoming).filter(c => c.trim() !== '');
+    if (!incomingChars.length) { inp.dataset.prevValue = raw; return; }
+
+    const inputs = getClozeInputs();
+    const startIdx = inputs.indexOf(inp);
+    if (startIdx < 0) return;
+
     const first = incomingChars[0];
-
-    // 当前空固定放新输入的第一个字
     setInputValue(inp, first);
     inp.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
 
     if (incomingChars.length > 1) {
-      // 其余字依次铺到后续空
-      distributeFrom(incomingChars.slice(1).join(''), startIdx + 1, inputs);
+      let cursor = startIdx + 1;
+      for (let i = 1; i < incomingChars.length; i++) {
+        if (cursor >= inputs.length) break;
+        const t = inputs[cursor];
+        setInputValue(t, incomingChars[i]);
+        t.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
+        cursor++;
+      }
+      focusFirstEmpty(cursor);
     } else {
-      // 只有一个字，光标跳到下一个空
       focusFirstEmpty(startIdx + 1);
     }
   }
@@ -800,8 +913,14 @@
     const inp = e.target;
     if (!isClozeInput(inp)) return;
     if (state.hintOn) return;
-    if (e.isComposing || inp.dataset.composing === '1') return;
-    distributeInput(inp);
+    if (e.isComposing) return;
+
+    setTimeout(() => {
+      if (state.hintOn) return;
+      if (!isClozeInput(inp)) return;
+      if (inp.dataset.composing === '1') return;
+      handleInput(inp);
+    }, 0);
   }, true);
 
   document.addEventListener('compositionstart', function (e) {
@@ -814,7 +933,7 @@
     if (!isClozeInput(inp)) return;
     inp.dataset.composing = '';
     if (state.hintOn) return;
-    distributeInput(inp);
+    handleInput(inp);
   }, true);
 
   document.addEventListener('keydown', function (e) {
@@ -917,7 +1036,6 @@
         triggerImport();
         break;
 
-      /* ---- 总览 ---- */
       case 'know':
         setStage(state.currentId, 'choice');
         state.step = 'choice';
@@ -925,6 +1043,7 @@
         state.choiceSeed = 0;
         state.feedback = null;
         state.pickedOption = null;
+        saveSession();
         render();
         break;
 
@@ -932,7 +1051,6 @@
         skipCurrent();
         break;
 
-      /* ---- 选择题 ---- */
       case 'pick-option': {
         state.pickedOption = el.dataset.value;
         state.feedback = null;
@@ -960,6 +1078,7 @@
         if (ok) {
           state.locking = true;
           setStage(state.currentId, 'cloze');
+          saveSession();
           state.feedback = { type: 'ok', text: '答对了，进入挖空填空' };
           updateFeedback('ok', '答对了，进入挖空填空');
           updateFoot();
@@ -969,6 +1088,7 @@
             state.pickedOption = null;
             state.locking = false;
             state.hintOn = false;
+            state.maskSeed = newMaskSeed();
             render();
           }, 700);
         } else {
@@ -1011,7 +1131,10 @@
         if (wrong === 0) {
           state.locking = true;
           if (state.step === 'cloze') {
-            setStage(state.currentId, 'full');
+            if (state.currentMode === 'learn') {
+              setStage(state.currentId, 'full');
+              saveSession();
+            }
             state.feedback = { type: 'ok', text: '全对！进入默写' };
             updateFeedback('ok', '全对！进入默写');
             updateFoot();
@@ -1024,8 +1147,8 @@
             }, 700);
           } else {
             markMastered(state.currentId);
-            state.feedback = { type: 'ok', text: '全对！本条已掌握' };
-            updateFeedback('ok', '全对！本条已掌握');
+            state.feedback = { type: 'ok', text: state.currentMode === 'review' ? '复习完成！' : '全对！本条已掌握' };
+            updateFeedback('ok', state.feedback.text);
             updateFoot();
             setTimeout(() => {
               state.locking = false;
@@ -1059,7 +1182,6 @@
         break;
       }
 
-      /* ---- 浏览 ---- */
       case 'view-subject':
         state.viewSubjectId = el.dataset.subject;
         render();
@@ -1070,9 +1192,10 @@
         break;
       case 'view-passage':
         state.subjectId = PASSAGE_MAP[el.dataset.passage].subjectId;
-        state.queue = [el.dataset.passage];
+        state.queue = [{ id: el.dataset.passage, mode: 'learn' }];
         state.queueTotal = 1;
         state.currentId = el.dataset.passage;
+        state.currentMode = 'learn';
         restoreStep();
         state.choice = null;
         state.feedback = null;
@@ -1080,6 +1203,7 @@
         state.locking = false;
         state.hintOn = false;
         state.screen = 'learn';
+        // 不保存 session：从条文库进入是旁路
         render();
         break;
     }

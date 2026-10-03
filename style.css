@@ -334,3 +334,16 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
 }
 .toast.ok { background: rgba(63, 138, 99, .96); }
 .toast.bad { background: rgba(191, 74, 68, .96); }
+/* 复习标记 */
+.review-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--gold);
+  padding: 1px 7px;
+  border-radius: 20px;
+  margin-left: 6px;
+  letter-spacing: .06em;
+  vertical-align: 1px;
+}
