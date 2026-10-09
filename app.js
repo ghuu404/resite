@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v4.6
-   修复：当天队列持久化，退出再进恢复进度
+   app.js — 经典条文背诵 v4.7
+   新增：挖空/默写页刷新按钮，重新随机挖空位置
    ============================================================ */
 (function () {
   'use strict';
@@ -327,7 +327,6 @@
     state.locking = false;
     state.hintOn = false;
 
-    // 尝试恢复今天的会话
     const today = todayKey();
     const saved = loadSession();
     let restored = false;
@@ -337,11 +336,9 @@
         && saved.subjectId === subjectId
         && Array.isArray(saved.queue)
         && saved.queue.length > 0) {
-      // 过滤掉已经被掌握（可能在其他地方做完）的条目
       const validQueue = saved.queue.filter(x => {
         if (!PASSAGE_MAP[x.id]) return false;
         if (x.mode === 'learn') {
-          // learn 模式下若已 mastered 就不再需要了
           return !isMastered(x.id);
         }
         return true;
@@ -538,7 +535,6 @@
       if (pr && (pr.stage === 'choice' || pr.stage === 'cloze' || pr.stage === 'full')) inProgress++;
     });
 
-    // 查看今天是否有未完成会话
     let sessionTip = '';
     const saved = loadSession();
     if (saved && saved.date === todayKey() && Array.isArray(saved.queue) && saved.queue.length > 0) {
@@ -615,7 +611,6 @@
       const st = getSubjectStats(s);
       const pct = st.total ? Math.round(st.mastered / st.total * 100) : 0;
 
-      // 若今天这个科目有未完成会话，用会话里的剩余数量替代
       let todayCount = st.today;
       let breakdown;
       const parts = [];
@@ -812,13 +807,15 @@
       return `<button class="btn-main" data-action="check-choice">检查</button>`;
     }
     if (state.step === 'cloze' || state.step === 'full') {
+      const hintLabel = state.hintOn ? '关闭提示' : '提示';
       if (fb && fb.type === 'bad') {
         return `
           <button class="btn-ghost" data-action="skip">跳过</button>
+          <button class="btn-ghost" data-action="refresh-cloze">刷新</button>
           <button class="btn-main" data-action="retry-cloze">重试</button>`;
       }
-      const hintLabel = state.hintOn ? '关闭提示' : '提示';
       return `
+        <button class="btn-ghost" data-action="refresh-cloze">刷新</button>
         <button class="btn-ghost" data-action="toggle-hint">${hintLabel}</button>
         <button class="btn-main" data-action="check-cloze">检查</button>`;
     }
@@ -1113,6 +1110,18 @@
         toggleHint();
         break;
 
+      /* ===== 刷新：重新随机挖空位置 + 清空输入 ===== */
+      case 'refresh-cloze': {
+        if (state.locking) break;
+        if (state.hintOn) clearHint();
+        state.maskSeed = newMaskSeed();
+        state.feedback = null;
+        const fb = document.getElementById('feedbackMsg');
+        if (fb) fb.remove();
+        render();
+        break;
+      }
+
       case 'check-cloze': {
         if (state.locking) break;
         if (state.hintOn) { clearHint(); updateFoot(); }
@@ -1203,7 +1212,6 @@
         state.locking = false;
         state.hintOn = false;
         state.screen = 'learn';
-        // 不保存 session：从条文库进入是旁路
         render();
         break;
     }
