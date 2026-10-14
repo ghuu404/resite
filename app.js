@@ -343,109 +343,132 @@
     render();
   }
 
-  /* ================= 朗读 ================= */
-  function splitForSpeech(text) {
-    const parts = String(text || '')
-      .replace(/\s+/g, '')
-      .split(/(?<=[，。、；：？！])/)
-      .map(s => s.trim())
-      .filter(Boolean);
-    return parts.length ? parts : [String(text || '')];
-  }
+ /* ================= 朗读 ================= */
+const speechState = { token: 0, loopTimer: null, audio: null };
 
-  function updateSpeakButtons() {
-    document.querySelectorAll('.speak-btn').forEach(btn => {
-      const id = btn.dataset.speakId;
-      if (id && id === state.speakingId) {
-        btn.classList.add('playing');
-        btn.textContent = '停';
-      } else {
-        btn.classList.remove('playing');
-        btn.textContent = '读';
-      }
-    });
-  }
+function splitForSpeech(text) {
+  const parts = String(text || '')
+    .replace(/\s+/g, '')
+    .split(/(?<=[，。、；：？！])/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  return parts.length ? parts : [String(text || '')];
+}
 
-  function stopSpeaking() {
-    speechState.token++;
-    if (speechState.loopTimer) {
-      clearTimeout(speechState.loopTimer);
-      speechState.loopTimer = null;
+function ensureAudio() {
+  if (speechState.audio) return speechState.audio;
+  const a = document.createElement('audio');
+  a.setAttribute('playsinline', '');
+  a.setAttribute('webkit-playsinline', '');
+  a.preload = 'auto';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  speechState.audio = a;
+  return a;
+}
+
+function updateSpeakButtons() {
+  document.querySelectorAll('.speak-btn').forEach(btn => {
+    const id = btn.dataset.speakId;
+    if (id && id === state.speakingId) {
+      btn.classList.add('playing');
+      btn.textContent = '停';
+    } else {
+      btn.classList.remove('playing');
+      btn.textContent = '读';
     }
-    if (speechState.audio) {
-      try {
-        speechState.audio.pause();
-        speechState.audio.removeAttribute('src');
-        speechState.audio.load();
-      } catch (e) {}
-      if (speechState.audio.parentNode) speechState.audio.parentNode.removeChild(speechState.audio);
-      speechState.audio = null;
-    }
-    state.speakingId = null;
-    updateSpeakButtons();
+  });
+}
+
+function stopSpeaking() {
+  speechState.token++;
+  if (speechState.loopTimer) {
+    clearTimeout(speechState.loopTimer);
+    speechState.loopTimer = null;
   }
+  if (speechState.audio) {
+    try {
+      speechState.audio.pause();
+      speechState.audio.currentTime = 0;
+    } catch (e) {}
+  }
+  state.speakingId = null;
+  updateSpeakButtons();
+}
 
-  // 关键：所有播放逻辑都在用户点击的同步栈里触发，浏览器不拦截
-  function speakText(id, text) {
-    stopSpeaking();
-    state.speakingId = id;
-    updateSpeakButtons();
+function speakText(id, text) {
+  stopSpeaking();
+  state.speakingId = id;
+  updateSpeakButtons();
 
-    const token = ++speechState.token;
-    const sentences = [];
-    splitForSpeech(text).forEach(s => {
-      if (s.length <= 100) sentences.push(s);
-      else for (let i = 0; i < s.length; i += 100) sentences.push(s.slice(i, i + 100));
-    });
-    let idx = 0;
+  const token = ++speechState.token;
+  const sentences = [];
+  splitForSpeech(text).forEach(s => {
+    if (s.length <= 100) sentences.push(s);
+    else for (let i = 0; i < s.length; i += 100) sentences.push(s.slice(i, i + 100));
+  });
+  let idx = 0;
 
-    // 创建一个持久 audio 元素
-    const audio = document.createElement('audio');
-    audio.setAttribute('playsinline', '');
-    audio.setAttribute('webkit-playsinline', '');
-    audio.style.display = 'none';
-    document.body.appendChild(audio);
-    speechState.audio = audio;
+  const audio = ensureAudio();
 
-    const playNext = () => {
-      if (token !== speechState.token) return;
-      if (idx >= sentences.length) {
-        speechState.loopTimer = setTimeout(() => {
-          if (token !== speechState.token) return;
-          idx = 0;
-          playNext();
-        }, 900);
-        return;
-      }
-      const s = sentences[idx++];
-      audio.src = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
-
-      let advanced = false;
-      const advance = () => {
-        if (advanced) return;
-        advanced = true;
+  const playNext = () => {
+    if (token !== speechState.token) return;
+    if (idx >= sentences.length) {
+      speechState.loopTimer = setTimeout(() => {
         if (token !== speechState.token) return;
+        idx = 0;
+        playNext();
+      }, 900);
+      return;
+    }
+    const s = sentences[idx++];
+    const url = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
+    console.log('[朗读] 播放:', s);
+
+    // 同步设置 src 并立即 play（在用户手势的同步栈里）
+    audio.src = url;
+    const p = audio.play();
+    if (p && p.then) {
+      p.then(() => {
+        console.log('[朗读] 开始播放');
+      }).catch(err => {
+        console.warn('[朗读] play 失败:', err && err.name, err && err.message);
+        // 300ms 后重试一次
         speechState.loopTimer = setTimeout(() => {
           if (token !== speechState.token) return;
-          playNext();
-        }, 450);
-      };
+          audio.play().catch(() => {
+            // 再失败就跳过这句
+            setTimeout(() => playNext(), 200);
+          });
+        }, 300);
+      });
+    }
+  };
 
-      audio.onended = advance;
-      audio.onerror = advance;
+  audio.onended = () => {
+    if (token !== speechState.token) return;
+    speechState.loopTimer = setTimeout(() => {
+      if (token !== speechState.token) return;
+      playNext();
+    }, 450);
+  };
+  audio.onerror = () => {
+    if (token !== speechState.token) return;
+    console.warn('[朗读] 音频加载失败');
+    speechState.loopTimer = setTimeout(() => {
+      if (token !== speechState.token) return;
+      playNext();
+    }, 450);
+  };
 
-      // 直接 play，不等 canplay。浏览器会等资源加载完自动播放。
-      const p = audio.play();
-      if (p && p.catch) p.catch(() => advance());
-    };
+  playNext();
+}
 
-    playNext();
-  }
+function toggleSpeak(id, text) {
+  if (state.speakingId === id) stopSpeaking();
+  else speakText(id, text);
+}
 
-  function toggleSpeak(id, text) {
-    if (state.speakingId === id) stopSpeaking();
-    else speakText(id, text);
-  }
 
   /* ================= 导出 / 导入 ================= */
   function exportData() {
