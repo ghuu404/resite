@@ -136,7 +136,6 @@
     viewSubjectId: null,
   };
 
-  const speechState = { token: 0, loopTimer: null, audio: null };
 
   function getExamLevels() {
     if (state.examType === 'school') {
@@ -344,132 +343,379 @@
   }
 
  /* ================= 朗读 ================= */
-const speechState = { token: 0, loopTimer: null, audio: null };
-
 function splitForSpeech(text) {
-  const parts = String(text || '')
-    .replace(/\s+/g, '')
-    .split(/(?<=[，。、；：？！])/)
-    .map(s => s.trim())
-    .filter(Boolean);
-  return parts.length ? parts : [String(text || '')];
-}
-
-function ensureAudio() {
-  if (speechState.audio) return speechState.audio;
-  const a = document.createElement('audio');
-  a.setAttribute('playsinline', '');
-  a.setAttribute('webkit-playsinline', '');
-  a.preload = 'auto';
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  speechState.audio = a;
-  return a;
-}
-
-function updateSpeakButtons() {
-  document.querySelectorAll('.speak-btn').forEach(btn => {
-    const id = btn.dataset.speakId;
-    if (id && id === state.speakingId) {
-      btn.classList.add('playing');
-      btn.textContent = '停';
-    } else {
-      btn.classList.remove('playing');
-      btn.textContent = '读';
-    }
-  });
-}
-
-function stopSpeaking() {
-  speechState.token++;
-  if (speechState.loopTimer) {
-    clearTimeout(speechState.loopTimer);
-    speechState.loopTimer = null;
+    // 不使用后行断言(?<...)，以兼容旧版 iOS Safari（<16.4），避免整段脚本解析失败白屏
+    const matched = String(text || '')
+      .replace(/\s+/g, '')
+      .match(/.+?[，。、；：？！]|.+$/g);
+    const parts = (matched || []).map(x => x.trim()).filter(Boolean);
+    return parts.length ? parts : [String(text || '')];
   }
-  if (speechState.audio) {
+
+  const SPEECH_KEY = 'jingdian-speech-v1';
+  const speechState = {
+    token: 0,
+    loopTimer: null,
+    safetyTimer: null,
+    audio: null,
+    mode: null,
+    rate: 1,
+    pitch: 1,
+    loop: true,
+    voiceURI: '',
+    clauses: [],
+    activeIdx: -1,
+  };
+
+  let _voices = [];
+  function refreshVoices() {
+    if (!('speechSynthesis' in window)) return;
+    try { _voices = window.speechSynthesis.getVoices() || []; } catch (e) { _voices = []; }
+  }
+  function synthSupported() {
+    return 'speechSynthesis' in window && typeof window.SpeechSynthesisUtterance !== 'undefined';
+  }
+  if (synthSupported()) {
+    refreshVoices();
+    window.speechSynthesis.onvoiceschanged = refreshVoices;
+  }
+  function getChineseVoices() {
+    if (!_voices.length) refreshVoices();
+    return _voices.filter(v => /^(zh|cmn|yue)/i.test(v.lang) || /(chinese|中文|普通话|国语)/i.test(v.name));
+  }
+  function pickVoice() {
+    const zh = getChineseVoices();
+    if (!zh.length) return null;
+    if (speechState.voiceURI) {
+      const f = zh.find(v => v.voiceURI === speechState.voiceURI);
+      if (f) return f;
+    }
+    const cn = zh.find(v => /^zh[-_]?cn/i.test(v.lang));
+    return cn || zh[0];
+  }
+
+  function loadSpeechSettings() {
     try {
-      speechState.audio.pause();
-      speechState.audio.currentTime = 0;
+      const raw = JSON.parse(localStorage.getItem(SPEECH_KEY) || '{}');
+      if (typeof raw.rate === 'number') speechState.rate = raw.rate;
+      if (typeof raw.pitch === 'number') speechState.pitch = raw.pitch;
+      if (typeof raw.loop === 'boolean') speechState.loop = raw.loop;
+      if (typeof raw.voiceURI === 'string') speechState.voiceURI = raw.voiceURI;
     } catch (e) {}
   }
-  state.speakingId = null;
-  updateSpeakButtons();
-}
+  function saveSpeechSettings() {
+    try {
+      localStorage.setItem(SPEECH_KEY, JSON.stringify({
+        rate: speechState.rate, pitch: speechState.pitch,
+        loop: speechState.loop, voiceURI: speechState.voiceURI
+      }));
+    } catch (e) {}
+  }
 
-function speakText(id, text) {
-  stopSpeaking();
-  state.speakingId = id;
-  updateSpeakButtons();
+  function ensureAudio() {
+    if (speechState.audio) return speechState.audio;
+    const a = document.createElement('audio');
+    a.setAttribute('playsinline', '');
+    a.setAttribute('webkit-playsinline', '');
+    a.preload = 'auto';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    speechState.audio = a;
+    return a;
+  }
 
-  const token = ++speechState.token;
-  const sentences = [];
-  splitForSpeech(text).forEach(s => {
-    if (s.length <= 100) sentences.push(s);
-    else for (let i = 0; i < s.length; i += 100) sentences.push(s.slice(i, i + 100));
-  });
-  let idx = 0;
+  function updateSpeakButtons() {
+    document.querySelectorAll('.speak-btn').forEach(btn => {
+      const id = btn.dataset.speakId;
+      if (id && id === state.speakingId) {
+        btn.classList.add('playing');
+        btn.textContent = '停';
+      } else {
+        btn.classList.remove('playing');
+        btn.textContent = '读';
+      }
+    });
+  }
 
-  const audio = ensureAudio();
+  function clearClauseHighlight() {
+    document.querySelectorAll('.cl.speaking').forEach(el => el.classList.remove('speaking'));
+    speechState.activeIdx = -1;
+  }
+  function highlightClause(i) {
+    document.querySelectorAll('.cl.speaking').forEach(el => el.classList.remove('speaking'));
+    const el = document.querySelector('.cl[data-ci="' + i + '"]');
+    if (el) { el.classList.add('speaking'); speechState.activeIdx = i; }
+  }
 
-  const playNext = () => {
-    if (token !== speechState.token) return;
-    if (idx >= sentences.length) {
-      speechState.loopTimer = setTimeout(() => {
-        if (token !== speechState.token) return;
-        idx = 0;
-        playNext();
-      }, 900);
+  function stopSpeaking() {
+    speechState.token++;
+    hideResumeBar();
+    if (speechState.loopTimer) { clearTimeout(speechState.loopTimer); speechState.loopTimer = null; }
+    if (speechState.safetyTimer) { clearTimeout(speechState.safetyTimer); speechState.safetyTimer = null; }
+    if (speechState.audio) {
+      try {
+        speechState.audio.onloadedmetadata = null;
+        speechState.audio.onended = null;
+        speechState.audio.onerror = null;
+        speechState.audio.pause();
+        speechState.audio.currentTime = 0;
+      } catch (e) {}
+    }
+    if (synthSupported()) { try { window.speechSynthesis.cancel(); } catch (e) {} }
+    state.speakingId = null;
+    clearClauseHighlight();
+    updateSpeakButtons();
+  }
+
+  function speakText(id, text) {
+    stopSpeaking();
+    state.speakingId = id;
+    updateSpeakButtons();
+
+    const token = ++speechState.token;
+    speechState.speakingToken = token;
+    const local = (window.AUDIO_INDEX && window.AUDIO_INDEX[id]) || null;
+    if (!local || !local.length) {
+      // 本地音频缺失：回退到系统语音合成（桌面端可用，手机端多数不支持）
+      if (synthSupported()) { speakWithSynth(id, text); return; }
+      state.speakingId = null; updateSpeakButtons();
+      showToast('该条文暂无本地音频', 'bad');
       return;
     }
-    const s = sentences[idx++];
-    const url = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
-    console.log('[朗读] 播放:', s);
+    const files = local;
+    speechState.clauses = files.map(x => x.t);
+    speechState.mode = 'local';
+    const audio = ensureAudio();
+    audio.loop = false;
 
-    // 同步设置 src 并立即 play（在用户手势的同步栈里）
-    audio.src = url;
-    const p = audio.play();
-    if (p && p.then) {
-      p.then(() => {
-        console.log('[朗读] 开始播放');
-      }).catch(err => {
-        console.warn('[朗读] play 失败:', err && err.name, err && err.message);
-        // 300ms 后重试一次
-        speechState.loopTimer = setTimeout(() => {
-          if (token !== speechState.token) return;
-          audio.play().catch(() => {
-            // 再失败就跳过这句
-            setTimeout(() => playNext(), 200);
-          });
-        }, 300);
+    // 依据刚播完分句的末尾标点决定停顿时长（逗号短、句末长）
+    function clauseGap(playedIdx) {
+      const lastChar = (files[playedIdx] && files[playedIdx].t || '').slice(-1);
+      if (lastChar === '，' || lastChar === '、') return 220;
+      if (lastChar === '。' || lastChar === '！' || lastChar === '？' || lastChar === '；' || lastChar === '：') return 460;
+      return 320;
+    }
+
+    function clearTimers() {
+      if (speechState.loopTimer) { clearTimeout(speechState.loopTimer); speechState.loopTimer = null; }
+      if (speechState.safetyTimer) { clearTimeout(speechState.safetyTimer); speechState.safetyTimer = null; }
+      audio.onloadedmetadata = null; audio.onended = null; audio.onerror = null;
+    }
+
+    function playClause(i) {
+      if (token !== speechState.token) return;
+      highlightClause(i);
+      const seg = files[i].t;
+      // 以「真实音频时长 + 标点停顿」驱动下一句；onended 仅作兜底，避免依赖其可靠性
+      let settled = false;
+      const goNext = () => {
+        if (settled) return; settled = true;
+        advance();
+      };
+      audio.onloadedmetadata = function () {
+        hideResumeBar();
+        const dur = (isFinite(audio.duration) && audio.duration > 0) ? audio.duration * 1000 : 0;
+        const wait = dur > 0 ? dur + clauseGap(i) : (seg.length * 300 + 400 + clauseGap(i));
+        speechState.loopTimer = setTimeout(goNext, wait);
+      };
+      audio.onended = function () {
+        hideResumeBar();
+        // 仅当拿不到时长时用「播完 + 停顿」兜底，保证标点停顿不丢失
+        if (isFinite(audio.duration) && audio.duration > 0) return;
+        speechState.loopTimer = setTimeout(goNext, clauseGap(i));
+      };
+      audio.onerror = function () {
+        showToast('第' + (i + 1) + '句加载失败，已跳过', 'bad');
+        goNext();
+      };
+      // 兜底：极端情况下 metadata 与 ended 都不触发时，强制推进，避免整段卡死
+      speechState.safetyTimer = setTimeout(goNext, Math.min(9000, seg.length * 400 + 1800));
+      audio.src = files[i].f;
+      const p = audio.play();
+      if (p && p.catch) p.catch(function () {
+        // 自动播放被浏览器拦截（小米浏览器等 file:// 场景常见）：
+        // 显示「点击继续」条，用户轻触屏幕任意处即可在真实手势内解锁并从当前句续读
+        showResumeBar(i);
       });
     }
-  };
 
-  audio.onended = () => {
-    if (token !== speechState.token) return;
-    speechState.loopTimer = setTimeout(() => {
+    function advance() {
       if (token !== speechState.token) return;
-      playNext();
-    }, 450);
-  };
-  audio.onerror = () => {
-    if (token !== speechState.token) return;
-    console.warn('[朗读] 音频加载失败');
-    speechState.loopTimer = setTimeout(() => {
-      if (token !== speechState.token) return;
-      playNext();
-    }, 450);
-  };
+      clearTimers();
+      const idx = speechState.activeIdx + 1;
+      if (idx >= files.length) {
+        if (speechState.loop) {
+          speechState.loopTimer = setTimeout(function () {
+            if (token !== speechState.token) return;
+            clearClauseHighlight();
+            playClause(0);
+          }, 700);
+        } else {
+          finishSpeaking();
+        }
+        return;
+      }
+      playClause(idx);
+    }
 
-  playNext();
-}
+    function finishSpeaking() {
+      speechState.token++;
+      hideResumeBar();
+      state.speakingId = null;
+      clearClauseHighlight();
+      updateSpeakButtons();
+    }
 
-function toggleSpeak(id, text) {
-  if (state.speakingId === id) stopSpeaking();
-  else speakText(id, text);
-}
+    // 暴露当前朗读实例的播放/清定时器函数，供「点击继续」重试时调用
+    speechState.currentPlayClause = playClause;
+    speechState.currentClearTimers = clearTimers;
+    // 首句在用户点击手势内触发，解锁移动端媒体播放并朗读
+    playClause(0);
+  }
 
+  // 系统语音合成兜底（仅当本地音频缺失时用于桌面端）
+  function speakWithSynth(id, text) {
+    try { if (synthSupported()) window.speechSynthesis.cancel(); } catch (e) {}
+    state.speakingId = id; updateSpeakButtons();
+    const token = ++speechState.token;
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'zh-CN'; u.rate = speechState.rate; u.pitch = speechState.pitch;
+    const v = pickVoice(); if (v) u.voice = v;
+    u.onend = function () { if (token === speechState.token) finishSpeakingSynth(); };
+    u.onerror = function () { if (token === speechState.token) finishSpeakingSynth(); };
+    speechState.mode = 'synth';
+    try { window.speechSynthesis.speak(u); } catch (e) {}
+  }
+  function finishSpeakingSynth() {
+    speechState.token++;
+    state.speakingId = null;
+    clearClauseHighlight();
+    updateSpeakButtons();
+  }
 
+  // ===== 自动播放被拦截时的「点击继续」机制（小米浏览器等 file:// 场景）=====
+  // 小米/部分浏览器禁止在用户手势之外连续自动播放音频：点「读」后第一句若在手势内被放行，
+  // 后续分句可能被拦。这里在被拦时提示用户轻触屏幕任意处，在真实手势内重播当前分句以解锁，
+  // 解锁后同一音频元素的后续分句通常可连续自动播放。
+  function hideResumeBar() {
+    const bar = document.getElementById('resumeBar');
+    if (bar) bar.classList.remove('show');
+    if (hideResumeBar._armed) {
+      document.removeEventListener('touchstart', hideResumeBar._armed, true);
+      document.removeEventListener('click', hideResumeBar._armed, true);
+      hideResumeBar._armed = null;
+    }
+  }
+  function showResumeBar(idx) {
+    let bar = document.getElementById('resumeBar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'resumeBar';
+      bar.className = 'resume-bar';
+      bar.innerHTML = '<span class="rb-ico">🔊</span><span class="rb-text">浏览器拦截了自动播放，点一下屏幕任意处继续朗读</span>';
+      document.body.appendChild(bar);
+    }
+    bar.classList.add('show');
+    // 挂一次性全局手势：用户轻触页面任意处即解锁并从当前分句续读（保证在真实手势内 play）
+    if (hideResumeBar._armed) {
+      document.removeEventListener('touchstart', hideResumeBar._armed, true);
+      document.removeEventListener('click', hideResumeBar._armed, true);
+    }
+    const handler = function (e) {
+      // 若点到的是控件（读/停按钮等），交给控件自身处理，本监听仅解除、不续播
+      if (e.target && e.target.closest && (e.target.closest('.speak-btn') || e.target.closest('[data-action]') || e.target.closest('.learn-foot'))) {
+        document.removeEventListener('touchstart', handler, true);
+        document.removeEventListener('click', handler, true);
+        hideResumeBar._armed = null;
+        return;
+      }
+      hideResumeBar();
+      retryClause(idx);
+    };
+    document.addEventListener('touchstart', handler, { capture: true, once: true });
+    document.addEventListener('click', handler, { capture: true, once: true });
+    hideResumeBar._armed = handler;
+  }
+  function retryClause(idx) {
+    hideResumeBar();
+    if (speechState.token !== speechState.speakingToken) return; // 已停止/切换，不再续播
+    // 清掉被拦截那句遗留的定时器，避免它稍后自动跳到下一句造成跳读
+    if (speechState.currentClearTimers) speechState.currentClearTimers();
+    speechState.activeIdx = idx - 1; // 让下一轮 advance 仍指向 idx+1
+    if (speechState.currentPlayClause) speechState.currentPlayClause(idx);
+  }
+
+  function toggleSpeak(id, text) {
+    if (state.speakingId === id) stopSpeaking();
+    else speakText(id, text);
+  }
+
+  function renderClauseSpans(text) {
+    const parts = splitForSpeech(text);
+    if (parts.length <= 1) return esc(text);
+    return parts.map((seg, i) => '<span class="cl" data-ci="' + i + '">' + esc(seg) + '</span>').join('');
+  }
+
+  function openSpeechSheet() {
+    let mask = document.getElementById('speechSheet');
+    if (!mask) {
+      mask = document.createElement('div');
+      mask.id = 'speechSheet';
+      mask.className = 'sheet-mask';
+      mask.innerHTML = `
+        <div class="sheet">
+          <div class="sheet-title">朗读设置</div>
+          <div class="sheet-tip">已生成离线中文语音（edge-tts），点「读」即可朗读，无需联网或下载语音包</div>
+          <div class="sheet-row">
+            <span class="sheet-label">语速</span>
+            <input type="range" id="speechRate" min="0.5" max="1.6" step="0.1" disabled>
+            <span class="sheet-val" id="speechRateVal">固定</span>
+          </div>
+          <div class="sheet-row">
+            <span class="sheet-label">循环朗读</span>
+            <input type="checkbox" id="speechLoop">
+          </div>
+          <button class="btn-main" data-action="speech-test" type="button" style="margin-top:14px">试听示例</button>
+          <button class="btn-sub" data-action="close-speech-sheet" type="button" style="margin-top:10px">完成</button>
+        </div>`;
+      document.body.appendChild(mask);
+      mask.addEventListener('click', (e) => { if (e.target === mask) closeSpeechSheet(); });
+    }
+    const rateEl = mask.querySelector('#speechRate');
+    const rateVal = mask.querySelector('#speechRateVal');
+    const loopEl = mask.querySelector('#speechLoop');
+    rateEl.value = speechState.rate;
+    rateVal.textContent = speechState.rate.toFixed(1) + 'x';
+    loopEl.checked = speechState.loop;
+    mask.classList.add('show');
+  }
+  function closeSpeechSheet() {
+    const mask = document.getElementById('speechSheet');
+    if (mask) mask.classList.remove('show');
+  }
+
+  document.addEventListener('input', function (e) {
+    const t = e.target;
+    if (!t) return;
+    if (t.id === 'speechRate') {
+      speechState.rate = parseFloat(t.value) || 1;
+      const v = document.getElementById('speechRateVal');
+      if (v) v.textContent = speechState.rate.toFixed(1) + 'x';
+      saveSpeechSettings();
+    } else if (t.id === 'speechLoop') {
+      speechState.loop = t.checked;
+      saveSpeechSettings();
+    } else if (t.id === 'speechVoice') {
+      speechState.voiceURI = t.value;
+      saveSpeechSettings();
+    }
+  });
+  document.addEventListener('change', function (e) {
+    const t = e.target;
+    if (!t) return;
+    if (t.id === 'speechLoop') { speechState.loop = t.checked; saveSpeechSettings(); }
+    else if (t.id === 'speechVoice') { speechState.voiceURI = t.value; saveSpeechSettings(); }
+  });
   /* ================= 导出 / 导入 ================= */
   function exportData() {
     const payload = {
@@ -631,6 +877,7 @@ function toggleSpeak(id, text) {
           </div>
           <button class="btn-main" data-action="goto-subjects">开始今日任务</button>
           <button class="btn-sub" data-action="goto-library">浏览条文库</button>
+          <button class="btn-sub" data-action="open-speech-sheet">🔊 朗读设置</button>
           <div class="backup-block">
             <div class="backup-title">存档</div>
             <div class="backup-row">
@@ -683,7 +930,7 @@ function toggleSpeak(id, text) {
             <div class="tt-kicker">今日任务</div>
             <div class="tt-name">选择经典</div>
           </div>
-          <div class="icon-btn ghost"></div>
+          <button class="icon-btn" data-action="open-speech-sheet" title="朗读设置" aria-label="朗读设置">🔊</button>
         </header>
         <main class="list-main">
           ${renderExamTabs()}
@@ -703,7 +950,7 @@ function toggleSpeak(id, text) {
           <header class="topbar">
             <button class="icon-btn" data-action="goto-subjects">‹</button>
             <div class="topbar-title"><div class="tt-name">任务完成</div></div>
-            <div class="icon-btn ghost"></div>
+            <button class="icon-btn" data-action="open-speech-sheet" title="朗读设置" aria-label="朗读设置">🔊</button>
           </header>
           <main class="learn-main">
             <div class="done-box">
@@ -779,8 +1026,8 @@ function toggleSpeak(id, text) {
   function renderOverview(p) {
     return `
       ${titleRow(p)}
-      <div class="classic passage-text">${esc(p.text)}</div>
-      <div class="hint-row">先默读一遍，凭印象判断是否记住了</div>
+      <div class="classic passage-text">${renderClauseSpans(p.text)}</div>
+      <div class="hint-row">先默读一遍，点「读」听标准朗读，凭印象判断是否记住了</div>
     `;
   }
   function renderChoice(p) {
@@ -1043,6 +1290,15 @@ function toggleSpeak(id, text) {
         if (psg) toggleSpeak(pid, psg.text);
         break;
       }
+      case 'open-speech-sheet':
+        openSpeechSheet();
+        break;
+      case 'close-speech-sheet':
+        closeSpeechSheet();
+        break;
+      case 'speech-test':
+        toggleSpeak('__speech_test__', '阴阳者，天地之道也，万物之纲纪，变化之父母。');
+        break;
 
       case 'know':
         stopSpeaking();
@@ -1250,7 +1506,7 @@ function toggleSpeak(id, text) {
           <header class="topbar">
             <button class="icon-btn" data-action="view-back">‹</button>
             <div class="topbar-title"><div class="tt-name">条文库</div></div>
-            <div class="icon-btn ghost"></div>
+            <button class="icon-btn" data-action="open-speech-sheet" title="朗读设置" aria-label="朗读设置">🔊</button>
           </header>
           <main class="list-main">
             ${renderExamTabs()}
@@ -1288,7 +1544,7 @@ function toggleSpeak(id, text) {
         <header class="topbar">
           <button class="icon-btn" data-action="view-back">‹</button>
           <div class="topbar-title"><div class="tt-name">${esc(subject.name)}</div></div>
-          <div class="icon-btn ghost"></div>
+          <button class="icon-btn" data-action="open-speech-sheet" title="朗读设置" aria-label="朗读设置">🔊</button>
         </header>
         <main class="list-main">
           <div class="passage-list">${items}</div>
@@ -1297,5 +1553,6 @@ function toggleSpeak(id, text) {
   }
 
   load();
-  render();
+  loadSpeechSettings();
+  setTimeout(render, 0);
 })();
