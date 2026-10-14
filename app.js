@@ -1,10 +1,7 @@
 /* ============================================================
-   app.js — 经典条文背诵 v4.9
-   新增：朗读（循环、句间停顿）
+   app.js — 经典条文背诵 v5.0
+   双考核 · 重点标记 · 有道朗读 · 存档 · 复习
    ============================================================ */
-window.onerror = function(m, s, l, c, err) {
-  alert('JS错误: ' + m + ' @' + l + ':' + c);
-};
 (function () {
   'use strict';
 
@@ -115,10 +112,37 @@ window.onerror = function(m, s, l, c, err) {
     };
   }
 
-  /* ================= 状态 ================= */
+  /* ================= 常量与状态 ================= */
   const STORAGE_KEY = 'jingdian-v4';
   const SESSION_KEY = 'jingdian-session-v1';
 
+  const state = {
+    screen: 'home',
+    dailyGoal: 10,
+    progress: {},
+    examType: 'national',
+    subjectId: null,
+    queue: [],
+    queueTotal: 0,
+    currentId: null,
+    currentMode: 'learn',
+    step: 'overview',
+    maskSeed: '',
+    choice: null,
+    choiceSeed: 0,
+    feedback: null,
+    pickedOption: null,
+    locking: false,
+    hintOn: false,
+    speakingId: null,
+    viewLevelId: 'L1',
+    viewSubjectId: null,
+  };
+
+  /* ================= 朗读状态 ================= */
+  const speechState = { token: 0, loopTimer: null, audio: null };
+
+  /* ================= 数据存取 ================= */
   function getExamLevels() {
     if (state.examType === 'school') {
       return DATA.levels.filter(l => l.id === 'school' && l.available !== false);
@@ -146,29 +170,6 @@ window.onerror = function(m, s, l, c, err) {
     const d = new Date();
     return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
   }
-
-  const state = {
-    screen: 'home',
-    dailyGoal: 10,
-    progress: {},
-    examType: 'national',
-    subjectId: null,
-    queue: [],
-    queueTotal: 0,
-    currentId: null,
-    currentMode: 'learn',
-    step: 'overview',
-    maskSeed: '',
-    choice: null,
-    choiceSeed: 0,
-    feedback: null,
-    pickedOption: null,
-    locking: false,
-    hintOn: false,
-    speakingId: null,     // 正在朗读的条文 id
-    viewLevelId: 'L1',
-    viewSubjectId: null,
-  };
 
   function load() {
     try {
@@ -348,6 +349,132 @@ window.onerror = function(m, s, l, c, err) {
     if (state.currentId) { restoreStep(); saveSession(); }
     else clearSession();
     render();
+  }
+
+  /* ================= 朗读 ================= */
+  function splitForSpeech(text) {
+    const parts = String(text || '')
+      .replace(/\s+/g, '')
+      .split(/(?<=[，。、；：？！])/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    return parts.length ? parts : [String(text || '')];
+  }
+
+  function updateSpeakButtons() {
+    document.querySelectorAll('.speak-btn').forEach(btn => {
+      const id = btn.dataset.speakId;
+      if (id && id === state.speakingId) {
+        btn.classList.add('playing');
+        btn.textContent = '停';
+      } else {
+        btn.classList.remove('playing');
+        btn.textContent = '读';
+      }
+    });
+  }
+
+  function stopSpeaking() {
+    speechState.token++;
+    if (speechState.loopTimer) {
+      clearTimeout(speechState.loopTimer);
+      speechState.loopTimer = null;
+    }
+    if (speechState.audio) {
+      try {
+        speechState.audio.pause();
+        speechState.audio.removeAttribute('src');
+        speechState.audio.load();
+      } catch (e) {}
+      if (speechState.audio.parentNode) speechState.audio.parentNode.removeChild(speechState.audio);
+      speechState.audio = null;
+    }
+    try {
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    } catch (e) {}
+    state.speakingId = null;
+    updateSpeakButtons();
+  }
+
+  function speakText(id, text) {
+    stopSpeaking();
+    state.speakingId = id;
+    updateSpeakButtons();
+
+    const token = ++speechState.token;
+    const sentences = [];
+    splitForSpeech(text).forEach(s => {
+      if (s.length <= 100) sentences.push(s);
+      else for (let i = 0; i < s.length; i += 100) sentences.push(s.slice(i, i + 100));
+    });
+    let idx = 0;
+
+    const playNext = () => {
+      if (token !== speechState.token) return;
+      if (idx >= sentences.length) {
+        speechState.loopTimer = setTimeout(() => {
+          if (token !== speechState.token) return;
+          idx = 0;
+          playNext();
+        }, 900);
+        return;
+      }
+      const s = sentences[idx++];
+      const url = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
+
+      const audio = document.createElement('audio');
+      audio.setAttribute('playsinline', '');
+      audio.setAttribute('webkit-playsinline', '');
+      audio.preload = 'auto';
+      audio.src = url;
+      audio.style.display = 'none';
+      document.body.appendChild(audio);
+      speechState.audio = audio;
+
+      const cleanup = () => {
+        try {
+          audio.pause();
+          audio.removeAttribute('src');
+          audio.load();
+        } catch (e) {}
+        if (audio.parentNode) audio.parentNode.removeChild(audio);
+      };
+
+      let advanced = false;
+      const advance = () => {
+        if (advanced) return;
+        advanced = true;
+        cleanup();
+        if (token !== speechState.token) return;
+        speechState.loopTimer = setTimeout(() => {
+          if (token !== speechState.token) return;
+          playNext();
+        }, 450);
+      };
+
+      audio.addEventListener('ended', advance);
+      audio.addEventListener('error', advance);
+
+      const tryPlay = () => {
+        if (advanced) return;
+        const p = audio.play();
+        if (p && p.catch) p.catch(() => advance());
+      };
+
+      if (audio.readyState >= 2) {
+        tryPlay();
+      } else {
+        audio.addEventListener('canplay', tryPlay, { once: true });
+        setTimeout(() => { if (!advanced && audio.readyState < 2) tryPlay(); }, 3000);
+      }
+    };
+
+    playNext();
+  }
+
+  function toggleSpeak(id, text) {
+    if (state.speakingId === id) stopSpeaking();
+    else speakText(id, text);
   }
 
   /* ================= 导出 / 导入 ================= */
@@ -1181,9 +1308,4 @@ window.onerror = function(m, s, l, c, err) {
   /* ================= 启动 ================= */
   load();
   render();
-
-  if (isSpeechSupported()) {
-    loadVoice();
-    window.speechSynthesis.onvoiceschanged = loadVoice;
-  }
 })();
