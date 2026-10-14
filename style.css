@@ -424,3 +424,16 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
   0%, 100% { box-shadow: 0 0 0 0 rgba(138, 90, 59, .45); }
   50% { box-shadow: 0 0 0 6px rgba(138, 90, 59, 0); }
 }
+/* 标题行 + 朗读按钮 */
+.passage-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.passage-title-row .passage-title {
+  margin-bottom: 0;
+  flex: 1;
+  min-width: 0;
+}

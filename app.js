@@ -1,11 +1,10 @@
 /* ============================================================
-   app.js — 经典条文背诵 v5.0
-   双考核 · 重点标记 · 有道朗读 · 存档 · 复习
+   app.js — 经典条文背诵 v6.1
+   修复音频播放 + 四步都有朗读按钮
    ============================================================ */
 (function () {
   'use strict';
 
-  /* ================= 工具 ================= */
   const PUNCT_RE = /[，。、；：？！“”‘’（）《》〈〉【】〔〕—…·,.;:?!"'()\[\]{}<>\/\\|_\-～~`@#$%^&*+= \u3000]/;
   const isPunct = ch => PUNCT_RE.test(ch);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -78,7 +77,6 @@
     return html;
   }
 
-  /* ================= 选择题 ================= */
   function generateChoice(passage, seedOffset) {
     const rng = mulberry32(hashStr(passage.id + '::choice::' + (seedOffset || 0)));
     const segs = splitSegments(passage.text).filter(s => s.length >= 3 && s.length <= 16);
@@ -112,7 +110,6 @@
     };
   }
 
-  /* ================= 常量与状态 ================= */
   const STORAGE_KEY = 'jingdian-v4';
   const SESSION_KEY = 'jingdian-session-v1';
 
@@ -139,10 +136,8 @@
     viewSubjectId: null,
   };
 
-  /* ================= 朗读状态 ================= */
   const speechState = { token: 0, loopTimer: null, audio: null };
 
-  /* ================= 数据存取 ================= */
   function getExamLevels() {
     if (state.examType === 'school') {
       return DATA.levels.filter(l => l.id === 'school' && l.available !== false);
@@ -188,7 +183,6 @@
       }));
     } catch (e) {}
   }
-
   function saveSession() {
     try {
       if (!state.subjectId || !state.queueTotal) return;
@@ -218,7 +212,6 @@
     }, 2200);
   }
 
-  /* ================= 进度 ================= */
   function getProg(id) { return state.progress[id] || (state.progress[id] = { stage: 'new' }); }
   function isMastered(id) { const pr = state.progress[id]; return pr && pr.stage === 'mastered'; }
   function isDueReview(id) {
@@ -254,7 +247,6 @@
              freshPlanned, today: unfinished + freshPlanned + due };
   }
 
-  /* ================= 队列 ================= */
   function buildQueueForSubject(subjectId) {
     const subject = findSubject(subjectId);
     if (!subject) return [];
@@ -389,13 +381,11 @@
       if (speechState.audio.parentNode) speechState.audio.parentNode.removeChild(speechState.audio);
       speechState.audio = null;
     }
-    try {
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-    } catch (e) {}
     state.speakingId = null;
     updateSpeakButtons();
   }
 
+  // 关键：所有播放逻辑都在用户点击的同步栈里触发，浏览器不拦截
   function speakText(id, text) {
     stopSpeaking();
     state.speakingId = id;
@@ -409,6 +399,14 @@
     });
     let idx = 0;
 
+    // 创建一个持久 audio 元素
+    const audio = document.createElement('audio');
+    audio.setAttribute('playsinline', '');
+    audio.setAttribute('webkit-playsinline', '');
+    audio.style.display = 'none';
+    document.body.appendChild(audio);
+    speechState.audio = audio;
+
     const playNext = () => {
       if (token !== speechState.token) return;
       if (idx >= sentences.length) {
@@ -420,31 +418,12 @@
         return;
       }
       const s = sentences[idx++];
-      const url = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
-
-      const audio = document.createElement('audio');
-      audio.setAttribute('playsinline', '');
-      audio.setAttribute('webkit-playsinline', '');
-      audio.preload = 'auto';
-      audio.src = url;
-      audio.style.display = 'none';
-      document.body.appendChild(audio);
-      speechState.audio = audio;
-
-      const cleanup = () => {
-        try {
-          audio.pause();
-          audio.removeAttribute('src');
-          audio.load();
-        } catch (e) {}
-        if (audio.parentNode) audio.parentNode.removeChild(audio);
-      };
+      audio.src = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
 
       let advanced = false;
       const advance = () => {
         if (advanced) return;
         advanced = true;
-        cleanup();
         if (token !== speechState.token) return;
         speechState.loopTimer = setTimeout(() => {
           if (token !== speechState.token) return;
@@ -452,21 +431,12 @@
         }, 450);
       };
 
-      audio.addEventListener('ended', advance);
-      audio.addEventListener('error', advance);
+      audio.onended = advance;
+      audio.onerror = advance;
 
-      const tryPlay = () => {
-        if (advanced) return;
-        const p = audio.play();
-        if (p && p.catch) p.catch(() => advance());
-      };
-
-      if (audio.readyState >= 2) {
-        tryPlay();
-      } else {
-        audio.addEventListener('canplay', tryPlay, { once: true });
-        setTimeout(() => { if (!advanced && audio.readyState < 2) tryPlay(); }, 3000);
-      }
+      // 直接 play，不等 canplay。浏览器会等资源加载完自动播放。
+      const p = audio.play();
+      if (p && p.catch) p.catch(() => advance());
     };
 
     playNext();
@@ -581,7 +551,6 @@
       </div>`;
   }
 
-  /* ---------- 首页 ---------- */
   function viewHome() {
     const total = ALL_PASSAGES.length;
     const mastered = masteredCount();
@@ -651,7 +620,6 @@
       </div>`;
   }
 
-  /* ---------- 科目页 ---------- */
   function viewSubjects() {
     const subjects = getAllSubjects();
     const saved = loadSession();
@@ -705,7 +673,6 @@
       </div>`;
   }
 
-  /* ---------- 学习页 ---------- */
   function viewLearn() {
     if (!state.currentId) {
       return `
@@ -730,7 +697,6 @@
     const doneCount = state.queueTotal - state.queue.length + 1;
     const posLabel = `${doneCount}/${state.queueTotal}`;
     const isReview = state.currentMode === 'review';
-    const isSpeaking = state.speakingId === p.id;
 
     let body = '';
     if (state.step === 'overview') body = renderOverview(p);
@@ -757,8 +723,6 @@
             <div class="tt-kicker">${esc(p.subjectName)} · ${esc(p.part || '')}${reviewTag}</div>
             <div class="tt-name">${esc(p.article)}</div>
           </div>
-          <span class="speak-btn ${isSpeaking ? 'playing' : ''}"
-                data-action="toggle-speak" data-speak-id="${esc(p.id)}">${isSpeaking ? '停' : '读'}</span>
           <div class="queue-badge">${posLabel}</div>
         </header>
         <div class="step-bar">${stepBar}</div>
@@ -776,10 +740,22 @@
     return order.indexOf(state.step) > order.indexOf(s);
   }
 
-  function renderOverview(p) {
+  // 每个步骤都带朗读按钮
+  function titleRow(p) {
     const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
+    const isSpeaking = state.speakingId === p.id;
     return `
-      <div class="passage-title">${tag}${esc(p.title)}</div>
+      <div class="passage-title-row">
+        <div class="passage-title">${tag}${esc(p.title)}</div>
+        <button class="speak-btn ${isSpeaking ? 'playing' : ''}"
+                data-action="toggle-speak" data-speak-id="${esc(p.id)}"
+                type="button">${isSpeaking ? '停' : '读'}</button>
+      </div>`;
+  }
+
+  function renderOverview(p) {
+    return `
+      ${titleRow(p)}
       <div class="classic passage-text">${esc(p.text)}</div>
       <div class="hint-row">先默读一遍，凭印象判断是否记住了</div>
     `;
@@ -788,7 +764,6 @@
     if (!state.choice) state.choice = generateChoice(p, state.choiceSeed);
     const q = state.choice;
     if (!q) return `<div class="empty-tip">无法生成选择题，请直接进入挖空。</div>`;
-    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     const letters = ['A', 'B', 'C', 'D'];
     const picked = state.pickedOption;
     const showResult = state.feedback && state.feedback.type;
@@ -803,7 +778,7 @@
       </button>`;
     }).join('');
     return `
-      <div class="passage-title">${tag}${esc(p.title)}</div>
+      ${titleRow(p)}
       <div class="classic quote">${esc(q.before)}<span class="quote-blank">____</span>${esc(q.after)}</div>
       <div class="options">${opts}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
@@ -811,9 +786,8 @@
   }
   function renderClozeStep(p) {
     const mask = buildMask(p.text, 'partial', state.maskSeed || String(Date.now()));
-    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     return `
-      <div class="passage-title">${tag}${esc(p.title)}</div>
+      ${titleRow(p)}
       <div class="hint-row">补全空缺处（挖去 50% 的字）。可连续输入，系统按字自动填入</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
@@ -821,9 +795,8 @@
   }
   function renderFullStep(p) {
     const mask = buildMask(p.text, 'full', p.id);
-    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     return `
-      <div class="passage-title">${tag}${esc(p.title)}</div>
+      ${titleRow(p)}
       <div class="hint-row">默写全文。可连续输入，标点已给出</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
@@ -861,7 +834,6 @@
     return '';
   }
 
-  /* ================= 输入处理 ================= */
   function isClozeInput(el) {
     return el && el.tagName === 'INPUT' && el.classList.contains('blank')
            && el.closest('#clozeBox');
@@ -963,7 +935,6 @@
     }
   }, true);
 
-  /* ================= 提示开关 ================= */
   function clearHint() {
     if (!state.hintOn) return;
     const inputs = getClozeInputs();
@@ -1007,7 +978,6 @@
     }
   }
 
-  /* ================= 事件 ================= */
   document.addEventListener('click', function (e) {
     const el = e.target.closest('[data-action]');
     if (!el) return;
@@ -1198,7 +1168,6 @@
         break;
       }
 
-      /* ---- 条文库 ---- */
       case 'view-subject':
         stopSpeaking();
         state.viewSubjectId = el.dataset.subject;
@@ -1236,7 +1205,6 @@
     }
   });
 
-  /* ================= 条文库 ================= */
   function viewLibrary() {
     const lvId = state.examType === 'school' ? 'school' : 'L1';
     const lv = DATA.levels.find(l => l.id === lvId);
@@ -1305,7 +1273,6 @@
       </div>`;
   }
 
-  /* ================= 启动 ================= */
   load();
   render();
 })();
