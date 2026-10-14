@@ -1,6 +1,6 @@
 /* ============================================================
-   app.js — 经典条文背诵 v4.7
-   新增：挖空/默写页刷新按钮，重新随机挖空位置
+   app.js — 经典条文背诵 v4.9
+   新增：朗读（循环、句间停顿）
    ============================================================ */
 (function () {
   'use strict';
@@ -40,7 +40,6 @@
     const chars = Array.from(text);
     const mask = new Array(chars.length).fill(-1);
     let gid = 0;
-
     if (mode === 'full') {
       for (let i = 0; i < chars.length; i++) {
         if (isPunct(chars[i])) continue;
@@ -48,14 +47,11 @@
       }
       return mask;
     }
-
     const candidates = [];
     for (let i = 0; i < chars.length; i++) {
       if (!isPunct(chars[i])) candidates.push(i);
     }
-    const total = candidates.length;
-    const blankCount = Math.max(1, Math.round(total * 0.5));
-
+    const blankCount = Math.max(1, Math.round(candidates.length * 0.5));
     const rng = mulberry32(hashStr(seed + '::partial'));
     const shuffled = shuffle(candidates.slice(), rng);
     const chosen = shuffled.slice(0, blankCount);
@@ -88,7 +84,6 @@
     const segs = splitSegments(passage.text).filter(s => s.length >= 3 && s.length <= 16);
     if (!segs.length) return null;
     const correct = segs[Math.floor(rng() * segs.length)];
-
     const pool = [];
     ALL_PASSAGES.forEach(p => {
       if (p.id === passage.id) return;
@@ -107,7 +102,6 @@
       if (!options.includes(c)) options.push(c);
     }
     if (options.length < 4) return null;
-
     const idx = passage.text.indexOf(correct);
     if (idx < 0) return null;
     return {
@@ -122,15 +116,19 @@
   const STORAGE_KEY = 'jingdian-v4';
   const SESSION_KEY = 'jingdian-session-v1';
 
+  function getExamLevels() {
+    if (state.examType === 'school') {
+      return DATA.levels.filter(l => l.id === 'school' && l.available !== false);
+    }
+    return DATA.levels.filter(l => l.id !== 'school' && l.available !== false);
+  }
   function getAllSubjects() {
     const out = [];
-    DATA.levels.forEach(lv => {
-      if (lv.available === false) return;
+    getExamLevels().forEach(lv => {
       (lv.subjects || []).forEach(s => out.push(s));
     });
     return out;
   }
-
   function findSubject(id) {
     let found = null;
     DATA.levels.forEach(lv => {
@@ -138,11 +136,9 @@
     });
     return found;
   }
-
   function newMaskSeed() {
     return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
   }
-
   function todayKey() {
     const d = new Date();
     return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
@@ -152,6 +148,7 @@
     screen: 'home',
     dailyGoal: 10,
     progress: {},
+    examType: 'national',
     subjectId: null,
     queue: [],
     queueTotal: 0,
@@ -165,6 +162,7 @@
     pickedOption: null,
     locking: false,
     hintOn: false,
+    speakingId: null,     // 正在朗读的条文 id
     viewLevelId: 'L1',
     viewSubjectId: null,
   };
@@ -174,37 +172,32 @@
       const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
       if (raw.dailyGoal) state.dailyGoal = raw.dailyGoal;
       if (raw.progress) state.progress = raw.progress;
+      if (raw.examType) state.examType = raw.examType;
     } catch (e) {}
   }
   function save() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         dailyGoal: state.dailyGoal,
-        progress: state.progress
+        progress: state.progress,
+        examType: state.examType
       }));
     } catch (e) {}
   }
 
-  /* ================= 当天会话持久化 ================= */
   function saveSession() {
     try {
-      if (!state.subjectId) return;
-      if (!state.queueTotal) return;
+      if (!state.subjectId || !state.queueTotal) return;
       localStorage.setItem(SESSION_KEY, JSON.stringify({
-        date: todayKey(),
-        subjectId: state.subjectId,
-        queue: state.queue,
-        total: state.queueTotal
+        date: todayKey(), subjectId: state.subjectId,
+        queue: state.queue, total: state.queueTotal
       }));
     } catch (e) {}
   }
-
   function loadSession() {
-    try {
-      return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
-    } catch (e) { return null; }
+    try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); }
+    catch (e) { return null; }
   }
-
   function clearSession() {
     try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
   }
@@ -231,13 +224,7 @@
   function masteredCount() { return ALL_PASSAGES.filter(p => isMastered(p.id)).length; }
   function dueReviewList() { return ALL_PASSAGES.filter(p => isDueReview(p.id)); }
   function remainingCount() { return ALL_PASSAGES.length - masteredCount(); }
-
-  function setStage(id, stage) {
-    const pr = getProg(id);
-    pr.stage = stage;
-    save();
-  }
-
+  function setStage(id, stage) { const pr = getProg(id); pr.stage = stage; save(); }
   function markMastered(id) {
     const pr = getProg(id);
     pr.stage = 'mastered';
@@ -247,7 +234,6 @@
     save();
   }
 
-  /* ================= 统计 ================= */
   function getSubjectStats(s) {
     let unfinished = 0, fresh = 0, due = 0, mastered = 0;
     s.passages.forEach(p => {
@@ -256,91 +242,54 @@
       if (stage === 'mastered') {
         mastered++;
         if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) due++;
-      } else if (stage === 'new' || !stage) {
-        fresh++;
-      } else {
-        unfinished++;
-      }
+      } else if (stage === 'new' || !stage) fresh++;
+      else unfinished++;
     });
     const freshPlanned = Math.min(fresh, state.dailyGoal);
-    return {
-      unfinished, fresh, due, mastered,
-      total: s.passages.length,
-      freshPlanned,
-      today: unfinished + freshPlanned + due
-    };
+    return { unfinished, fresh, due, mastered, total: s.passages.length,
+             freshPlanned, today: unfinished + freshPlanned + due };
   }
 
   /* ================= 队列 ================= */
   function buildQueueForSubject(subjectId) {
     const subject = findSubject(subjectId);
     if (!subject) return [];
-
-    const unfinished = [];
-    const fresh = [];
-    const due = [];
-
+    const unfinished = [], fresh = [], due = [];
     subject.passages.forEach(p => {
       const pr = state.progress[p.id];
       const stage = pr ? pr.stage : 'new';
       if (stage === 'mastered') {
-        if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) {
-          due.push({ id: p.id, mode: 'review' });
-        }
-      } else if (stage === 'new' || !stage) {
-        fresh.push({ id: p.id, mode: 'learn' });
-      } else {
-        unfinished.push({ id: p.id, mode: 'learn' });
-      }
+        if (pr.nextReviewAt && pr.nextReviewAt <= Date.now()) due.push({ id: p.id, mode: 'review' });
+      } else if (stage === 'new' || !stage) fresh.push({ id: p.id, mode: 'learn' });
+      else unfinished.push({ id: p.id, mode: 'learn' });
     });
-
-    return [
-      ...unfinished,
-      ...fresh.slice(0, state.dailyGoal),
-      ...due
-    ];
+    return [...unfinished, ...fresh.slice(0, state.dailyGoal), ...due];
   }
 
   function restoreStep() {
     const pr = state.progress[state.currentId];
     const stage = pr ? pr.stage : 'new';
-
     if (state.currentMode === 'review') {
-      if (stage === 'full') state.step = 'full';
-      else state.step = 'cloze';
+      state.step = (stage === 'full') ? 'full' : 'cloze';
     } else {
-      if (stage === 'choice' || stage === 'cloze' || stage === 'full') {
-        state.step = stage;
-      } else {
-        state.step = 'overview';
-      }
+      state.step = (stage === 'choice' || stage === 'cloze' || stage === 'full') ? stage : 'overview';
     }
-
     state.maskSeed = newMaskSeed();
   }
 
   function startSubject(subjectId) {
+    stopSpeaking();
     state.subjectId = subjectId;
-    state.choice = null;
-    state.feedback = null;
-    state.pickedOption = null;
-    state.locking = false;
-    state.hintOn = false;
-
+    state.choice = null; state.feedback = null; state.pickedOption = null;
+    state.locking = false; state.hintOn = false;
     const today = todayKey();
     const saved = loadSession();
     let restored = false;
-
-    if (saved
-        && saved.date === today
-        && saved.subjectId === subjectId
-        && Array.isArray(saved.queue)
-        && saved.queue.length > 0) {
+    if (saved && saved.date === today && saved.subjectId === subjectId
+        && Array.isArray(saved.queue) && saved.queue.length > 0) {
       const validQueue = saved.queue.filter(x => {
         if (!PASSAGE_MAP[x.id]) return false;
-        if (x.mode === 'learn') {
-          return !isMastered(x.id);
-        }
+        if (x.mode === 'learn') return !isMastered(x.id);
         return true;
       });
       if (validQueue.length > 0) {
@@ -349,21 +298,17 @@
         restored = true;
       }
     }
-
     if (!restored) {
       state.queue = buildQueueForSubject(subjectId);
       state.queueTotal = state.queue.length;
     }
-
     if (!state.queue.length) {
-      state.currentId = null;
-      state.currentMode = 'learn';
+      state.currentId = null; state.currentMode = 'learn';
       clearSession();
       state.screen = 'learn';
       render();
       return;
     }
-
     state.currentId = state.queue[0].id;
     state.currentMode = state.queue[0].mode;
     restoreStep();
@@ -374,69 +319,51 @@
 
   function skipCurrent() {
     if (state.queue.length <= 1) return;
+    stopSpeaking();
     const item = state.queue.shift();
     state.queue.push(item);
     state.currentId = state.queue[0].id;
     state.currentMode = state.queue[0].mode;
-    state.choice = null;
-    state.feedback = null;
-    state.pickedOption = null;
-    state.locking = false;
-    state.hintOn = false;
+    state.choice = null; state.feedback = null; state.pickedOption = null;
+    state.locking = false; state.hintOn = false;
     restoreStep();
     saveSession();
     render();
   }
 
   function advanceQueue() {
+    stopSpeaking();
     state.queue = state.queue.filter(x => x.id !== state.currentId);
     if (state.queue.length) {
       state.currentId = state.queue[0].id;
       state.currentMode = state.queue[0].mode;
     } else {
-      state.currentId = null;
-      state.currentMode = 'learn';
-      state.step = 'overview';
+      state.currentId = null; state.currentMode = 'learn'; state.step = 'overview';
     }
-    state.choice = null;
-    state.feedback = null;
-    state.pickedOption = null;
-    state.locking = false;
-    state.hintOn = false;
-    if (state.currentId) {
-      restoreStep();
-      saveSession();
-    } else {
-      clearSession();
-    }
+    state.choice = null; state.feedback = null; state.pickedOption = null;
+    state.locking = false; state.hintOn = false;
+    if (state.currentId) { restoreStep(); saveSession(); }
+    else clearSession();
     render();
   }
 
   /* ================= 导出 / 导入 ================= */
   function exportData() {
     const payload = {
-      app: 'jingdian',
-      version: 4,
-      exportedAt: new Date().toISOString(),
-      dailyGoal: state.dailyGoal,
-      progress: state.progress
+      app: 'jingdian', version: 4, exportedAt: new Date().toISOString(),
+      dailyGoal: state.dailyGoal, progress: state.progress, examType: state.examType
     };
-    const json = JSON.stringify(payload, null, 2);
-    const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     const d = new Date();
     const pad = n => String(n).padStart(2, '0');
     const fname = `经典条文存档_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.json`;
-    a.href = url;
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast('已导出：' + fname, 'ok');
   }
-
   function importData(file) {
     const reader = new FileReader();
     reader.onload = function (ev) {
@@ -444,19 +371,15 @@
         const raw = JSON.parse(ev.target.result);
         if (!raw || typeof raw !== 'object') throw new Error('格式不对');
         if (!raw.progress || typeof raw.progress !== 'object') throw new Error('缺少 progress');
-        const valid = {};
-        let skipped = 0;
+        const valid = {}; let skipped = 0;
         Object.keys(raw.progress).forEach(k => {
-          if (PASSAGE_MAP[k]) valid[k] = raw.progress[k];
-          else skipped++;
+          if (PASSAGE_MAP[k]) valid[k] = raw.progress[k]; else skipped++;
         });
         if (!Object.keys(valid).length) throw new Error('没有可用的进度数据');
-
         Object.assign(state.progress, valid);
         if (raw.dailyGoal) state.dailyGoal = raw.dailyGoal;
-        save();
-        state.screen = 'home';
-        render();
+        if (raw.examType) state.examType = raw.examType;
+        save(); state.screen = 'home'; render();
         showToast(`导入成功，共 ${Object.keys(valid).length} 条` + (skipped ? `（${skipped} 条无法匹配）` : ''), 'ok');
       } catch (err) {
         showToast('导入失败：' + (err.message || '文件损坏'), 'bad');
@@ -465,11 +388,9 @@
     reader.onerror = function () { showToast('读取文件失败', 'bad'); };
     reader.readAsText(file, 'utf-8');
   }
-
   function triggerImport() {
     const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json,application/json';
+    input.type = 'file'; input.accept = '.json,application/json';
     input.style.display = 'none';
     input.addEventListener('change', function () {
       const f = input.files && input.files[0];
@@ -478,6 +399,116 @@
     });
     document.body.appendChild(input);
     input.click();
+  }
+
+  /* ================= 朗读 ================= */
+  const speechState = { token: 0, loopTimer: null, voice: null };
+
+  function isSpeechSupported() {
+    return typeof window !== 'undefined' && 'speechSynthesis' in window
+           && typeof window.SpeechSynthesisUtterance === 'function';
+  }
+
+  // 按中文标点切句，作为朗读单元
+  function splitForSpeech(text) {
+    const parts = String(text || '')
+      .replace(/\s+/g, '')
+      .split(/(?<=[，。、；：？！])/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    return parts.length ? parts : [String(text || '')];
+  }
+
+  function loadVoice() {
+    if (!isSpeechSupported()) return;
+    const voices = window.speechSynthesis.getVoices();
+    speechState.voice =
+      voices.find(v => v.lang === 'zh-CN') ||
+      voices.find(v => v.lang === 'zh-Hans' || v.lang === 'zh-Hans-CN') ||
+      voices.find(v => v.lang && v.lang.toLowerCase().startsWith('zh')) ||
+      null;
+  }
+
+  function updateSpeakButtons() {
+    document.querySelectorAll('.speak-btn').forEach(btn => {
+      const id = btn.dataset.speakId;
+      if (id && id === state.speakingId) {
+        btn.classList.add('playing');
+        btn.textContent = '停';
+      } else {
+        btn.classList.remove('playing');
+        btn.textContent = '读';
+      }
+    });
+  }
+
+  function stopSpeaking() {
+    speechState.token++;
+    if (speechState.loopTimer) {
+      clearTimeout(speechState.loopTimer);
+      speechState.loopTimer = null;
+    }
+    try {
+      if (isSpeechSupported()) window.speechSynthesis.cancel();
+    } catch (e) {}
+    state.speakingId = null;
+    updateSpeakButtons();
+  }
+
+  function speakText(id, text) {
+    if (!isSpeechSupported()) {
+      showToast('当前浏览器不支持朗读', 'bad');
+      return;
+    }
+    stopSpeaking();
+    state.speakingId = id;
+    const token = ++speechState.token;
+    const sentences = splitForSpeech(text);
+    let idx = 0;
+
+    const speakNext = () => {
+      if (token !== speechState.token) return;
+      if (idx >= sentences.length) {
+        // 整段读完，间隔后循环
+        speechState.loopTimer = setTimeout(() => {
+          if (token !== speechState.token) return;
+          idx = 0;
+          speakNext();
+        }, 900);
+        return;
+      }
+      const s = sentences[idx++];
+      const u = new SpeechSynthesisUtterance(s);
+      u.lang = 'zh-CN';
+      u.rate = 0.9;
+      u.pitch = 1;
+      u.volume = 1;
+      if (speechState.voice) u.voice = speechState.voice;
+      u.onend = () => {
+        if (token !== speechState.token) return;
+        // 句间停顿
+        speechState.loopTimer = setTimeout(() => {
+          if (token !== speechState.token) return;
+          speakNext();
+        }, 450);
+      };
+      u.onerror = () => {
+        if (token !== speechState.token) return;
+        speechState.loopTimer = setTimeout(() => {
+          if (token !== speechState.token) return;
+          speakNext();
+        }, 450);
+      };
+      try { window.speechSynthesis.speak(u); } catch (e) {}
+    };
+
+    updateSpeakButtons();
+    speakNext();
+  }
+
+  function toggleSpeak(id, text) {
+    if (state.speakingId === id) stopSpeaking();
+    else speakText(id, text);
   }
 
   /* ================= 渲染 ================= */
@@ -489,11 +520,11 @@
     else if (state.screen === 'library') root.innerHTML = viewLibrary();
     if (!document.getElementById('toast')) {
       const t = document.createElement('div');
-      t.id = 'toast';
-      t.className = 'toast';
+      t.id = 'toast'; t.className = 'toast';
       document.body.appendChild(t);
     }
     window.scrollTo(0, 0);
+    updateSpeakButtons();
     if (state.screen === 'learn' && (state.step === 'cloze' || state.step === 'full')) {
       setTimeout(() => {
         const b = document.querySelector('#clozeBox input.blank');
@@ -514,11 +545,20 @@
     fb.textContent = text || '';
     if (!text) fb.remove();
   }
-
   function updateFoot() {
     const foot = document.getElementById('learnFoot');
     if (!foot) return;
     foot.innerHTML = renderFoot();
+  }
+
+  function renderExamTabs() {
+    return `
+      <div class="exam-tabs">
+        <button class="exam-tab ${state.examType === 'national' ? 'active' : ''}"
+                data-action="switch-exam" data-exam="national">全国经典考核</button>
+        <button class="exam-tab ${state.examType === 'school' ? 'active' : ''}"
+                data-action="switch-exam" data-exam="school">学校经典考核</button>
+      </div>`;
   }
 
   /* ---------- 首页 ---------- */
@@ -528,24 +568,19 @@
     const remain = total - mastered;
     const days = Math.ceil(remain / state.dailyGoal) || 1;
     const due = dueReviewList().length;
-
     let inProgress = 0;
     ALL_PASSAGES.forEach(p => {
       const pr = state.progress[p.id];
       if (pr && (pr.stage === 'choice' || pr.stage === 'cloze' || pr.stage === 'full')) inProgress++;
     });
-
     let sessionTip = '';
     const saved = loadSession();
     if (saved && saved.date === todayKey() && Array.isArray(saved.queue) && saved.queue.length > 0) {
       const subj = findSubject(saved.subjectId);
       if (subj) {
-        sessionTip = `<div class="due-tip" style="background:var(--green-soft);color:var(--green)">
-          今日「${esc(subj.name)}」还有 <b>${saved.queue.length}</b> 条未完成
-        </div>`;
+        sessionTip = `<div class="due-tip" style="background:var(--green-soft);color:var(--green)">今日「${esc(subj.name)}」还有 <b>${saved.queue.length}</b> 条未完成</div>`;
       }
     }
-
     return `
       <div class="page">
         <header class="home-head">
@@ -557,7 +592,6 @@
             </div>
           </div>
         </header>
-
         <main class="home-main">
           <div class="hero">
             <div class="hero-row">
@@ -575,20 +609,16 @@
             ${sessionTip}
             ${inProgress > 0 && !sessionTip ? `<div class="due-tip" style="background:var(--accent-soft);color:var(--accent)">有 <b>${inProgress}</b> 条进行中，进入后会先继续</div>` : ''}
           </div>
-
           <div class="card">
             <div class="card-title">每日学习量</div>
             <div class="goal-row">
-              <input type="range" id="goalRange" min="5" max="50" step="5"
-                     value="${state.dailyGoal}">
+              <input type="range" id="goalRange" min="5" max="50" step="5" value="${state.dailyGoal}">
               <div class="goal-value"><b id="goalNum">${state.dailyGoal}</b> 条 / 天</div>
             </div>
             <div class="days-tip">按此进度，约 <b id="daysNum">${days}</b> 天完成全部条文</div>
           </div>
-
           <button class="btn-main" data-action="goto-subjects">开始今日任务</button>
           <button class="btn-sub" data-action="goto-library">浏览条文库</button>
-
           <div class="backup-block">
             <div class="backup-title">存档</div>
             <div class="backup-row">
@@ -606,11 +636,9 @@
     const subjects = getAllSubjects();
     const saved = loadSession();
     const today = todayKey();
-
     const cards = subjects.map(s => {
       const st = getSubjectStats(s);
       const pct = st.total ? Math.round(st.mastered / st.total * 100) : 0;
-
       let todayCount = st.today;
       let breakdown;
       const parts = [];
@@ -618,13 +646,11 @@
       if (st.freshPlanned > 0) parts.push(`${st.freshPlanned} 新学`);
       if (st.due > 0) parts.push(`${st.due} 复习`);
       breakdown = parts.length ? parts.join(' · ') : '今日无任务';
-
       if (saved && saved.date === today && saved.subjectId === s.id
           && Array.isArray(saved.queue) && saved.queue.length > 0) {
         todayCount = saved.queue.length;
         breakdown = '今日未完成，进入继续';
       }
-
       return `
         <button class="subject-card" data-action="start-subject" data-subject="${s.id}" style="padding:16px">
           <span class="sc-icon">${s.icon || '📖'}</span>
@@ -637,9 +663,7 @@
           <span class="sc-arrow">›</span>
         </button>`;
     }).join('');
-
     const totalDue = dueReviewList().length;
-
     return `
       <div class="page">
         <header class="topbar">
@@ -650,13 +674,13 @@
           </div>
           <div class="icon-btn ghost"></div>
         </header>
-
         <main class="list-main">
+          ${renderExamTabs()}
           <div class="select-hint">
             未完成的优先继续，新学每科最多 ${state.dailyGoal} 条，到期复习自动接在最后
             ${totalDue > 0 ? `（今日共 ${totalDue} 条待复习）` : ''}
           </div>
-          <div class="subject-list">${cards}</div>
+          <div class="subject-list">${cards || '<div class="empty-tip">该考核暂无科目</div>'}</div>
         </main>
       </div>`;
   }
@@ -682,11 +706,11 @@
           </main>
         </div>`;
     }
-
     const p = PASSAGE_MAP[state.currentId];
     const doneCount = state.queueTotal - state.queue.length + 1;
     const posLabel = `${doneCount}/${state.queueTotal}`;
     const isReview = state.currentMode === 'review';
+    const isSpeaking = state.speakingId === p.id;
 
     let body = '';
     if (state.step === 'overview') body = renderOverview(p);
@@ -696,19 +720,13 @@
 
     const steps = isReview
       ? [{ k: 'cloze', label: '空' }, { k: 'full', label: '默' }]
-      : [
-          { k: 'overview', label: '览' },
-          { k: 'choice', label: '选' },
-          { k: 'cloze', label: '空' },
-          { k: 'full', label: '默' }
-        ];
-
+      : [{ k: 'overview', label: '览' }, { k: 'choice', label: '选' },
+         { k: 'cloze', label: '空' }, { k: 'full', label: '默' }];
     const stepBar = steps.map(s => {
       const active = state.step === s.k ? 'active' : '';
       const done = stepDone(s.k) ? 'done' : '';
       return `<div class="step-dot ${active} ${done}">${s.label}</div>`;
     }).join('');
-
     const reviewTag = isReview ? '<span class="review-tag">复习</span>' : '';
 
     return `
@@ -719,13 +737,12 @@
             <div class="tt-kicker">${esc(p.subjectName)} · ${esc(p.part || '')}${reviewTag}</div>
             <div class="tt-name">${esc(p.article)}</div>
           </div>
+          <span class="speak-btn ${isSpeaking ? 'playing' : ''}"
+                data-action="toggle-speak" data-speak-id="${esc(p.id)}">${isSpeaking ? '停' : '读'}</span>
           <div class="queue-badge">${posLabel}</div>
         </header>
-
         <div class="step-bar">${stepBar}</div>
-
         <main class="learn-body">${body}</main>
-
         <footer class="learn-foot" id="learnFoot">${renderFoot()}</footer>
       </div>`;
   }
@@ -740,17 +757,18 @@
   }
 
   function renderOverview(p) {
+    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     return `
-      <div class="passage-title">${esc(p.title)}</div>
+      <div class="passage-title">${tag}${esc(p.title)}</div>
       <div class="classic passage-text">${esc(p.text)}</div>
       <div class="hint-row">先默读一遍，凭印象判断是否记住了</div>
     `;
   }
-
   function renderChoice(p) {
     if (!state.choice) state.choice = generateChoice(p, state.choiceSeed);
     const q = state.choice;
     if (!q) return `<div class="empty-tip">无法生成选择题，请直接进入挖空。</div>`;
+    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     const letters = ['A', 'B', 'C', 'D'];
     const picked = state.pickedOption;
     const showResult = state.feedback && state.feedback.type;
@@ -765,17 +783,17 @@
       </button>`;
     }).join('');
     return `
-      <div class="passage-title">${esc(p.title)}</div>
+      <div class="passage-title">${tag}${esc(p.title)}</div>
       <div class="classic quote">${esc(q.before)}<span class="quote-blank">____</span>${esc(q.after)}</div>
       <div class="options">${opts}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
     `;
   }
-
   function renderClozeStep(p) {
     const mask = buildMask(p.text, 'partial', state.maskSeed || String(Date.now()));
+    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     return `
-      <div class="passage-title">${esc(p.title)}</div>
+      <div class="passage-title">${tag}${esc(p.title)}</div>
       <div class="hint-row">补全空缺处（挖去 50% 的字）。可连续输入，系统按字自动填入</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
@@ -783,8 +801,9 @@
   }
   function renderFullStep(p) {
     const mask = buildMask(p.text, 'full', p.id);
+    const tag = p.tag ? `<span class="passage-tag">${esc(p.tag)}</span>` : '';
     return `
-      <div class="passage-title">${esc(p.title)}</div>
+      <div class="passage-title">${tag}${esc(p.title)}</div>
       <div class="hint-row">默写全文。可连续输入，标点已给出</div>
       <div class="classic cloze-text" id="clozeBox">${renderCloze(p.text, mask)}</div>
       ${state.feedback ? `<div class="feedback ${state.feedback.type}" id="feedbackMsg">${esc(state.feedback.text)}</div>` : ''}
@@ -822,18 +841,16 @@
     return '';
   }
 
-  /* ================= 核心：输入处理 ================= */
+  /* ================= 输入处理 ================= */
   function isClozeInput(el) {
     return el && el.tagName === 'INPUT' && el.classList.contains('blank')
            && el.closest('#clozeBox');
   }
-
   function getClozeInputs() {
     const box = document.getElementById('clozeBox');
     if (!box) return [];
     return Array.from(box.querySelectorAll('input.blank'));
   }
-
   function focusFirstEmpty(fromIdx) {
     const inputs = getClozeInputs();
     for (let i = fromIdx; i < inputs.length; i++) {
@@ -844,53 +861,36 @@
     }
     if (inputs.length) try { inputs[inputs.length - 1].focus(); } catch (e) {}
   }
-
   function setInputValue(inp, val) {
     inp.value = val;
     inp.dataset.prevValue = val;
   }
-
   function handleInput(inp) {
     if (!isClozeInput(inp)) return;
     if (state.hintOn) return;
-
     const raw = (inp.value || '').replace(/\s+/g, '');
     const prev = inp.dataset.prevValue || '';
-
     if (raw === prev) return;
-
     if (!raw) { inp.dataset.prevValue = ''; return; }
-
     let incoming = '';
-    if (!prev) {
-      incoming = raw;
-    } else if (raw.length > prev.length) {
+    if (!prev) incoming = raw;
+    else if (raw.length > prev.length) {
       if (raw.startsWith(prev)) incoming = raw.slice(prev.length);
       else if (raw.endsWith(prev)) incoming = raw.slice(0, raw.length - prev.length);
       else incoming = raw;
     } else if (raw.length < prev.length) {
-      if (prev.indexOf(raw) >= 0) {
-        inp.dataset.prevValue = raw;
-        return;
-      }
+      if (prev.indexOf(raw) >= 0) { inp.dataset.prevValue = raw; return; }
       incoming = raw;
-    } else {
-      incoming = raw;
-    }
-
+    } else incoming = raw;
     if (!incoming) { inp.dataset.prevValue = raw; return; }
-
     const incomingChars = Array.from(incoming).filter(c => c.trim() !== '');
     if (!incomingChars.length) { inp.dataset.prevValue = raw; return; }
-
     const inputs = getClozeInputs();
     const startIdx = inputs.indexOf(inp);
     if (startIdx < 0) return;
-
     const first = incomingChars[0];
     setInputValue(inp, first);
     inp.classList.remove('correct', 'wrong', 'revealed', 'hint-wrong');
-
     if (incomingChars.length > 1) {
       let cursor = startIdx + 1;
       for (let i = 1; i < incomingChars.length; i++) {
@@ -901,17 +901,13 @@
         cursor++;
       }
       focusFirstEmpty(cursor);
-    } else {
-      focusFirstEmpty(startIdx + 1);
-    }
+    } else focusFirstEmpty(startIdx + 1);
   }
-
   document.addEventListener('input', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
     if (state.hintOn) return;
     if (e.isComposing) return;
-
     setTimeout(() => {
       if (state.hintOn) return;
       if (!isClozeInput(inp)) return;
@@ -919,12 +915,10 @@
       handleInput(inp);
     }, 0);
   }, true);
-
   document.addEventListener('compositionstart', function (e) {
     const inp = e.target;
     if (isClozeInput(inp)) inp.dataset.composing = '1';
   }, true);
-
   document.addEventListener('compositionend', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
@@ -932,7 +926,6 @@
     if (state.hintOn) return;
     handleInput(inp);
   }, true);
-
   document.addEventListener('keydown', function (e) {
     const inp = e.target;
     if (!isClozeInput(inp)) return;
@@ -963,7 +956,6 @@
     });
     state.hintOn = false;
   }
-
   function toggleHint() {
     const inputs = getClozeInputs();
     if (state.hintOn) {
@@ -1004,49 +996,52 @@
     switch (action) {
 
       case 'goto-home':
-        state.screen = 'home';
-        state.locking = false;
-        render();
+        stopSpeaking();
+        state.screen = 'home'; state.locking = false; render();
         break;
-
       case 'goto-subjects':
-        state.screen = 'subjects';
-        state.locking = false;
-        render();
+        stopSpeaking();
+        state.screen = 'subjects'; state.locking = false; render();
+        break;
+      case 'goto-library':
+        stopSpeaking();
+        state.screen = 'library'; state.viewSubjectId = null; render();
         break;
 
-      case 'goto-library':
-        state.screen = 'library';
+      case 'switch-exam': {
+        stopSpeaking();
+        state.examType = el.dataset.exam;
         state.viewSubjectId = null;
-        render();
+        save(); render();
         break;
+      }
 
       case 'start-subject':
         startSubject(el.dataset.subject);
         break;
 
-      case 'export-data':
-        exportData();
-        break;
+      case 'export-data': exportData(); break;
+      case 'import-data': triggerImport(); break;
 
-      case 'import-data':
-        triggerImport();
+      case 'toggle-speak':
+      case 'speak-item': {
+        const pid = el.dataset.speakId;
+        const psg = PASSAGE_MAP[pid];
+        if (psg) toggleSpeak(pid, psg.text);
         break;
+      }
 
       case 'know':
+        stopSpeaking();
         setStage(state.currentId, 'choice');
         state.step = 'choice';
-        state.choice = null;
-        state.choiceSeed = 0;
-        state.feedback = null;
-        state.pickedOption = null;
+        state.choice = null; state.choiceSeed = 0;
+        state.feedback = null; state.pickedOption = null;
         saveSession();
         render();
         break;
 
-      case 'skip':
-        skipCurrent();
-        break;
+      case 'skip': skipCurrent(); break;
 
       case 'pick-option': {
         state.pickedOption = el.dataset.value;
@@ -1073,6 +1068,7 @@
           if (!ok && o.dataset.value === state.pickedOption) o.classList.add('wrong');
         });
         if (ok) {
+          stopSpeaking();
           state.locking = true;
           setStage(state.currentId, 'cloze');
           saveSession();
@@ -1081,10 +1077,8 @@
           updateFoot();
           setTimeout(() => {
             state.step = 'cloze';
-            state.feedback = null;
-            state.pickedOption = null;
-            state.locking = false;
-            state.hintOn = false;
+            state.feedback = null; state.pickedOption = null;
+            state.locking = false; state.hintOn = false;
             state.maskSeed = newMaskSeed();
             render();
           }, 700);
@@ -1099,9 +1093,7 @@
       case 'retry-choice':
         if (state.locking) break;
         state.choiceSeed = Math.floor(Math.random() * 1e9);
-        state.choice = null;
-        state.feedback = null;
-        state.pickedOption = null;
+        state.choice = null; state.feedback = null; state.pickedOption = null;
         render();
         break;
 
@@ -1110,9 +1102,9 @@
         toggleHint();
         break;
 
-      /* ===== 刷新：重新随机挖空位置 + 清空输入 ===== */
       case 'refresh-cloze': {
         if (state.locking) break;
+        stopSpeaking();
         if (state.hintOn) clearHint();
         state.maskSeed = newMaskSeed();
         state.feedback = null;
@@ -1125,7 +1117,6 @@
       case 'check-cloze': {
         if (state.locking) break;
         if (state.hintOn) { clearHint(); updateFoot(); }
-
         const box = document.getElementById('clozeBox');
         if (!box) break;
         const inputs = Array.from(box.querySelectorAll('input.blank'));
@@ -1140,21 +1131,17 @@
         if (wrong === 0) {
           state.locking = true;
           if (state.step === 'cloze') {
-            if (state.currentMode === 'learn') {
-              setStage(state.currentId, 'full');
-              saveSession();
-            }
+            if (state.currentMode === 'learn') { setStage(state.currentId, 'full'); saveSession(); }
             state.feedback = { type: 'ok', text: '全对！进入默写' };
             updateFeedback('ok', '全对！进入默写');
             updateFoot();
             setTimeout(() => {
               state.step = 'full';
-              state.feedback = null;
-              state.locking = false;
-              state.hintOn = false;
+              state.feedback = null; state.locking = false; state.hintOn = false;
               render();
             }, 700);
           } else {
+            stopSpeaking();
             markMastered(state.currentId);
             state.feedback = { type: 'ok', text: state.currentMode === 'review' ? '复习完成！' : '全对！本条已掌握' };
             updateFeedback('ok', state.feedback.text);
@@ -1174,7 +1161,7 @@
 
       case 'retry-cloze': {
         if (state.locking) break;
-        if (state.hintOn) { clearHint(); }
+        if (state.hintOn) clearHint();
         document.querySelectorAll('#clozeBox input.blank').forEach(inp => {
           inp.value = '';
           inp.dataset.prevValue = '';
@@ -1191,26 +1178,27 @@
         break;
       }
 
+      /* ---- 条文库 ---- */
       case 'view-subject':
+        stopSpeaking();
         state.viewSubjectId = el.dataset.subject;
         render();
         break;
       case 'view-back':
+        stopSpeaking();
         if (state.viewSubjectId) { state.viewSubjectId = null; render(); }
         else { state.screen = 'home'; render(); }
         break;
       case 'view-passage':
+        stopSpeaking();
         state.subjectId = PASSAGE_MAP[el.dataset.passage].subjectId;
         state.queue = [{ id: el.dataset.passage, mode: 'learn' }];
         state.queueTotal = 1;
         state.currentId = el.dataset.passage;
         state.currentMode = 'learn';
         restoreStep();
-        state.choice = null;
-        state.feedback = null;
-        state.pickedOption = null;
-        state.locking = false;
-        state.hintOn = false;
+        state.choice = null; state.feedback = null; state.pickedOption = null;
+        state.locking = false; state.hintOn = false;
         state.screen = 'learn';
         render();
         break;
@@ -1230,7 +1218,8 @@
 
   /* ================= 条文库 ================= */
   function viewLibrary() {
-    const lv = DATA.levels.find(l => l.id === state.viewLevelId);
+    const lvId = state.examType === 'school' ? 'school' : 'L1';
+    const lv = DATA.levels.find(l => l.id === lvId);
     if (!lv || !lv.available) return viewHome();
 
     if (!state.viewSubjectId) {
@@ -1253,7 +1242,8 @@
             <div class="icon-btn ghost"></div>
           </header>
           <main class="list-main">
-            <div class="subject-list">${cards}</div>
+            ${renderExamTabs()}
+            <div class="subject-list">${cards || '<div class="empty-tip">暂无科目</div>'}</div>
           </main>
         </div>`;
     }
@@ -1270,11 +1260,15 @@
       } else if (pr && (pr.stage === 'choice' || pr.stage === 'cloze' || pr.stage === 'full')) {
         tag = '<span class="tag due">进行中</span>';
       }
+      const star = p.tag ? `<span class="passage-tag" style="margin-right:6px">${esc(p.tag)}</span>` : '';
+      const isSpeaking = state.speakingId === p.id;
       return `<button class="passage-item" data-action="view-passage" data-passage="${p.id}">
         <span class="pi-main">
-          <span class="pi-title">${esc(p.title)}</span>
+          <span class="pi-title">${star}${esc(p.title)}</span>
           <span class="pi-article">${esc(p.article)}</span>
         </span>
+        <span class="speak-btn small ${isSpeaking ? 'playing' : ''}"
+              data-action="speak-item" data-speak-id="${esc(p.id)}">${isSpeaking ? '停' : '读'}</span>
         ${tag}
       </button>`;
     }).join('');
@@ -1294,4 +1288,9 @@
   /* ================= 启动 ================= */
   load();
   render();
+
+  if (isSpeechSupported()) {
+    loadVoice();
+    window.speechSynthesis.onvoiceschanged = loadVoice;
+  }
 })();
