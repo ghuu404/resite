@@ -566,8 +566,8 @@ function speakText(id, text) {
   stopSpeaking();
   state.speakingId = id;
   updateSpeakButtons();
-  if (isSpeechSupported()) speakNative(id, text);
-  else speakYoudao(id, text);
+  // 默认用有道 TTS（不依赖系统语音包，微信/手机浏览器都能出声）
+  speakYoudao(id, text);
 }
 
 function toggleSpeak(id, text) {
