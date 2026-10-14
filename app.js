@@ -402,114 +402,178 @@
   }
 
   /* ================= 朗读 ================= */
-  const speechState = { token: 0, loopTimer: null, voice: null };
+  /* ================= 朗读 ================= */
+const speechState = { token: 0, loopTimer: null, voice: null, audio: null };
 
-  function isSpeechSupported() {
-    return typeof window !== 'undefined' && 'speechSynthesis' in window
-           && typeof window.SpeechSynthesisUtterance === 'function';
-  }
+function isSpeechSupported() {
+  return typeof window !== 'undefined' && 'speechSynthesis' in window
+         && typeof window.SpeechSynthesisUtterance === 'function';
+}
 
-  // 按中文标点切句，作为朗读单元
-  function splitForSpeech(text) {
-    const parts = String(text || '')
-      .replace(/\s+/g, '')
-      .split(/(?<=[，。、；：？！])/)
-      .map(s => s.trim())
-      .filter(Boolean);
-    return parts.length ? parts : [String(text || '')];
-  }
+function splitForSpeech(text) {
+  const parts = String(text || '')
+    .replace(/\s+/g, '')
+    .split(/(?<=[，。、；：？！])/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  return parts.length ? parts : [String(text || '')];
+}
 
-  function loadVoice() {
-    if (!isSpeechSupported()) return;
-    const voices = window.speechSynthesis.getVoices();
-    speechState.voice =
-      voices.find(v => v.lang === 'zh-CN') ||
-      voices.find(v => v.lang === 'zh-Hans' || v.lang === 'zh-Hans-CN') ||
-      voices.find(v => v.lang && v.lang.toLowerCase().startsWith('zh')) ||
-      null;
-  }
+function loadVoice() {
+  if (!isSpeechSupported()) return;
+  const voices = window.speechSynthesis.getVoices();
+  speechState.voice =
+    voices.find(v => v.lang === 'zh-CN') ||
+    voices.find(v => v.lang === 'zh-Hans' || v.lang === 'zh-Hans-CN') ||
+    voices.find(v => v.lang && v.lang.toLowerCase().startsWith('zh')) ||
+    null;
+}
 
-  function updateSpeakButtons() {
-    document.querySelectorAll('.speak-btn').forEach(btn => {
-      const id = btn.dataset.speakId;
-      if (id && id === state.speakingId) {
-        btn.classList.add('playing');
-        btn.textContent = '停';
-      } else {
-        btn.classList.remove('playing');
-        btn.textContent = '读';
-      }
-    });
-  }
-
-  function stopSpeaking() {
-    speechState.token++;
-    if (speechState.loopTimer) {
-      clearTimeout(speechState.loopTimer);
-      speechState.loopTimer = null;
+function updateSpeakButtons() {
+  document.querySelectorAll('.speak-btn').forEach(btn => {
+    const id = btn.dataset.speakId;
+    if (id && id === state.speakingId) {
+      btn.classList.add('playing');
+      btn.textContent = '停';
+    } else {
+      btn.classList.remove('playing');
+      btn.textContent = '读';
     }
-    try {
-      if (isSpeechSupported()) window.speechSynthesis.cancel();
-    } catch (e) {}
-    state.speakingId = null;
-    updateSpeakButtons();
-  }
+  });
+}
 
-  function speakText(id, text) {
-    if (!isSpeechSupported()) {
-      showToast('当前浏览器不支持朗读', 'bad');
+function stopSpeaking() {
+  speechState.token++;
+  if (speechState.loopTimer) {
+    clearTimeout(speechState.loopTimer);
+    speechState.loopTimer = null;
+  }
+  if (speechState.audio) {
+    try {
+      speechState.audio.pause();
+      speechState.audio.src = '';
+    } catch (e) {}
+    speechState.audio = null;
+  }
+  try {
+    if (isSpeechSupported()) window.speechSynthesis.cancel();
+  } catch (e) {}
+  state.speakingId = null;
+  updateSpeakButtons();
+}
+
+// ---- 方案 A：浏览器原生（桌面 / 安卓 Chrome / iOS Safari）----
+function speakNative(id, text) {
+  const token = ++speechState.token;
+  const sentences = splitForSpeech(text);
+  let idx = 0;
+
+  const speakNext = () => {
+    if (token !== speechState.token) return;
+    if (idx >= sentences.length) {
+      speechState.loopTimer = setTimeout(() => {
+        if (token !== speechState.token) return;
+        idx = 0;
+        speakNext();
+      }, 900);
       return;
     }
-    stopSpeaking();
-    state.speakingId = id;
-    const token = ++speechState.token;
-    const sentences = splitForSpeech(text);
-    let idx = 0;
-
-    const speakNext = () => {
+    const s = sentences[idx++];
+    const u = new SpeechSynthesisUtterance(s);
+    u.lang = 'zh-CN';
+    u.rate = 0.9;
+    u.pitch = 1;
+    u.volume = 1;
+    if (speechState.voice) u.voice = speechState.voice;
+    u.onend = () => {
       if (token !== speechState.token) return;
-      if (idx >= sentences.length) {
-        // 整段读完，间隔后循环
-        speechState.loopTimer = setTimeout(() => {
-          if (token !== speechState.token) return;
-          idx = 0;
-          speakNext();
-        }, 900);
-        return;
-      }
-      const s = sentences[idx++];
-      const u = new SpeechSynthesisUtterance(s);
-      u.lang = 'zh-CN';
-      u.rate = 0.9;
-      u.pitch = 1;
-      u.volume = 1;
-      if (speechState.voice) u.voice = speechState.voice;
-      u.onend = () => {
+      speechState.loopTimer = setTimeout(() => {
         if (token !== speechState.token) return;
-        // 句间停顿
-        speechState.loopTimer = setTimeout(() => {
-          if (token !== speechState.token) return;
-          speakNext();
-        }, 450);
-      };
-      u.onerror = () => {
-        if (token !== speechState.token) return;
-        speechState.loopTimer = setTimeout(() => {
-          if (token !== speechState.token) return;
-          speakNext();
-        }, 450);
-      };
-      try { window.speechSynthesis.speak(u); } catch (e) {}
+        speakNext();
+      }, 450);
     };
+    u.onerror = () => {
+      if (token !== speechState.token) return;
+      speechState.loopTimer = setTimeout(() => {
+        if (token !== speechState.token) return;
+        speakNext();
+      }, 450);
+    };
+    try { window.speechSynthesis.speak(u); } catch (e) {}
+  };
+  speakNext();
+}
 
-    updateSpeakButtons();
-    speakNext();
-  }
+// ---- 方案 B：有道 TTS（微信 / QQ / 不支持原生时）----
+function speakYoudao(id, text) {
+  const token = ++speechState.token;
+  // 有道单次限制约 200 字，按句切分后超长的再按 100 字切
+  const sentences = [];
+  splitForSpeech(text).forEach(s => {
+    if (s.length <= 100) sentences.push(s);
+    else {
+      for (let i = 0; i < s.length; i += 100) {
+        sentences.push(s.slice(i, i + 100));
+      }
+    }
+  });
+  let idx = 0;
 
-  function toggleSpeak(id, text) {
-    if (state.speakingId === id) stopSpeaking();
-    else speakText(id, text);
-  }
+  const playNext = () => {
+    if (token !== speechState.token) return;
+    if (idx >= sentences.length) {
+      speechState.loopTimer = setTimeout(() => {
+        if (token !== speechState.token) return;
+        idx = 0;
+        playNext();
+      }, 900);
+      return;
+    }
+    const s = sentences[idx++];
+    const url = 'https://dict.youdao.com/dictvoice?le=zh&audio=' + encodeURIComponent(s);
+    const audio = new Audio(url);
+    speechState.audio = audio;
+    audio.onended = () => {
+      if (token !== speechState.token) return;
+      speechState.loopTimer = setTimeout(() => {
+        if (token !== speechState.token) return;
+        playNext();
+      }, 450);
+    };
+    audio.onerror = () => {
+      if (token !== speechState.token) return;
+      speechState.loopTimer = setTimeout(() => {
+        if (token !== speechState.token) return;
+        playNext();
+      }, 450);
+    };
+    const p = audio.play();
+    if (p && p.catch) {
+      p.catch(() => {
+        // 播放被拒绝（罕见），跳过这句继续
+        if (token !== speechState.token) return;
+        speechState.loopTimer = setTimeout(() => {
+          if (token !== speechState.token) return;
+          playNext();
+        }, 300);
+      });
+    }
+  };
+  playNext();
+}
+
+function speakText(id, text) {
+  stopSpeaking();
+  state.speakingId = id;
+  updateSpeakButtons();
+  if (isSpeechSupported()) speakNative(id, text);
+  else speakYoudao(id, text);
+}
+
+function toggleSpeak(id, text) {
+  if (state.speakingId === id) stopSpeaking();
+  else speakText(id, text);
+}
 
   /* ================= 渲染 ================= */
   function render() {
