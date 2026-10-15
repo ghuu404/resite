@@ -5,6 +5,29 @@
 (function () {
   'use strict';
 
+  // 全局错误可视化：任何未被捕获的错误都显示在页面上，避免「白屏无提示」（便于在 VIA 等浏览器定位问题）
+  function showFatal(msg) {
+    try {
+      var box = document.getElementById('fatalBox');
+      if (!box) {
+        box = document.createElement('div');
+        box.id = 'fatalBox';
+        box.style.cssText = 'position:fixed;left:12px;right:12px;top:12px;z-index:99999;background:#fff3f2;' +
+          'color:#b34;font:13px/1.6 -apple-system,system-ui,sans-serif;padding:14px 16px;border:1px solid #e0b4b0;' +
+          'border-radius:10px;white-space:pre-wrap;max-height:70vh;overflow:auto;box-shadow:0 6px 20px rgba(0,0,0,.15)';
+        (document.body || document.documentElement).appendChild(box);
+      }
+      box.textContent = '⚠️ 页面脚本出错（请把这段发给我）：\n' + msg;
+    } catch (e) {}
+  }
+  window.onerror = function (message, src, line, col, err) {
+    showFatal((err && err.stack) ? err.stack : (message + ' @ ' + (src || '') + ':' + (line || 0) + ':' + (col || 0)));
+    return false;
+  };
+  window.addEventListener('unhandledrejection', function (e) {
+    showFatal('Promise 未处理: ' + ((e && e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+  });
+
   const PUNCT_RE = /[，。、；：？！“”‘’（）《》〈〉【】〔〕—…·,.;:?!"'()\[\]{}<>\/\\|_\-～~`@#$%^&*+= \u3000]/;
   const isPunct = ch => PUNCT_RE.test(ch);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1552,7 +1575,11 @@ function splitForSpeech(text) {
       </div>`;
   }
 
-  load();
-  loadSpeechSettings();
-  setTimeout(render, 0);
+  try {
+    load();
+    loadSpeechSettings();
+    setTimeout(render, 0);
+  } catch (e) {
+    showFatal((e && e.stack) ? e.stack : String(e));
+  }
 })();
